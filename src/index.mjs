@@ -611,11 +611,14 @@ async function extractVisibleComments(root) {
       return (
         /\bReply\b|پاسخ/i.test(n) ||
         /\bLike\b|پسندیدن/i.test(n) ||
-        /\btime\b/i.test(n) ||
         /\bview all \d+ replies\b/i.test(n) ||
-        /\bview hidden comments\b/i.test(n)
+        /\bview hidden comments\b/i.test(n) ||
+        /\bmore replies\b/i.test(n)
       );
     };
+
+    const profileCountFor = el => Array.from(el.querySelectorAll('a[href^="/"]'))
+      .filter(a => validProfileHref(a.getAttribute('href'))).length;
 
     const parseRow = (row, usernameHint = '', profilePathHint = '') => {
       const rowText = (row.innerText || '').trim();
@@ -623,10 +626,15 @@ async function extractVisibleComments(root) {
       const usernameNorm = normalize(usernameHint);
       const profileNorm = normalize(profilePathHint.replace(/^\//, ''));
 
+      const profileLinks = Array.from(row.querySelectorAll('a[href^="/"]'))
+        .filter(a => validProfileHref(a.getAttribute('href')));
+      const profileCount = profileLinks.length;
+      const timeCount = row.querySelectorAll('time').length;
+
       let username = usernameHint || '';
       let started = !usernameNorm;
       const content = [];
-      let time = row.querySelector('time')?.textContent?.trim() || '';
+      const rowControlText = normalize(rowText);
 
       for (const line of lines) {
         const n = normalize(line);
@@ -661,10 +669,13 @@ async function extractVisibleComments(root) {
       commentText = commentText.replace(/^[:\-–—]+/, '').trim();
       return {
         username,
-        time,
+        time: row.querySelector('time')?.textContent?.trim() || '',
         rowText,
         commentText,
-        hasReply: commonCommentSignals(rowText),
+        lineCount: lines.length,
+        profileCount,
+        timeCount,
+        hasReply: commonCommentSignals(rowControlText),
         hasTime: !!row.querySelector('time'),
         hasControl: !!row.querySelector('button,[role="button"]')
       };
@@ -677,8 +688,15 @@ async function extractVisibleComments(root) {
       const parsed = parseRow(row, username, profilePath);
       const cleanUsername = normalize(parsed.username);
       const cleanComment = normalize(parsed.commentText);
+      const controlText = normalize(parsed.rowText);
+
       if (!cleanUsername || !cleanComment) return false;
+      if (parsed.profileCount !== 1) return false;
+      if (parsed.timeCount < 1) return false;
+      if (parsed.lineCount < 2 || parsed.lineCount > 15) return false;
+      if (parsed.rowText.length < 18 || parsed.rowText.length > 900) return false;
       if (/^(reply|پاسخ|like|پسندیدن|view all|view hidden comments|load more comments|view more comments)$/i.test(cleanComment)) return false;
+      if (/these comments were hidden/i.test(controlText)) return false;
       const key = `${compact(profilePath)}|${compact(cleanUsername)}|${compact(cleanComment)}`;
       if (seen.has(key)) return false;
       seen.add(key);
@@ -688,6 +706,9 @@ async function extractVisibleComments(root) {
         commentText: parsed.commentText,
         time: parsed.time,
         rowText: parsed.rowText,
+        lineCount: parsed.lineCount,
+        profileCount: parsed.profileCount,
+        timeCount: parsed.timeCount,
         key,
         source,
         hasReply: parsed.hasReply,
@@ -711,9 +732,13 @@ async function extractVisibleComments(root) {
         if (!node) break;
 
         const txt = (node.innerText || '').trim();
-        if (!txt || txt.length > 1400) continue;
+        if (!txt || txt.length > 900) continue;
         const ntext = normalize(txt);
         if (!ntext.includes(normalize(username))) continue;
+
+        const profileCount = profileCountFor(node);
+        const timeCount = node.querySelectorAll('time').length;
+        if (profileCount !== 1 || timeCount < 1) continue;
         if (!commonCommentSignals(ntext) && !node.querySelector('time')) continue;
 
         row = node;
@@ -743,9 +768,16 @@ async function extractVisibleComments(root) {
         ) {
           return false;
         }
+
         const text = (el.innerText || '').trim();
-        if (text.length < 12 || text.length > 1200) return false;
+        if (text.length < 12 || text.length > 900) return false;
         if (/^(reply|like|save|share|view all|view hidden comments|add a comment)$/i.test(normalize(text))) return false;
+
+        const profileCount = profileCountFor(el);
+        const timeCount = el.querySelectorAll('time').length;
+        const lineCount = text.split(/\n+/).map(x => x.trim()).filter(Boolean).length;
+        if (profileCount !== 1 || timeCount < 1 || lineCount < 2 || lineCount > 15) return false;
+
         return commonCommentSignals(text) || !!el.querySelector('time') || !!el.querySelector('a[href^="/"]');
       })
       .sort((a, b) => {
@@ -759,43 +791,18 @@ async function extractVisibleComments(root) {
       const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
       if (!lines.length) continue;
 
-      const time = el.querySelector('time')?.textContent?.trim() || '';
       const profileLink = Array.from(el.querySelectorAll('a[href^="/"]')).find(a => validProfileHref(a.getAttribute('href')));
       const username = profileLink?.textContent?.trim() || lines.find(line => {
         const n = normalize(line);
         return !isNoiseLine(line) && line.length <= 40 && !/\s/.test(line) && !/^\d/.test(n);
       }) || '';
 
-      let commentStart = -1;
-      if (profileLink) {
-        const profileNorm = normalize(profileLink.textContent || '');
-        commentStart = lines.findIndex(line => normalize(line) === profileNorm);
-      }
-      if (commentStart < 0 && username) {
-        const usernameNorm = normalize(username);
-        commentStart = lines.findIndex(line => normalize(line) === usernameNorm);
-      }
-      if (commentStart < 0) commentStart = 0;
-
-      const commentParts = [];
-      for (let i = commentStart + 1; i < lines.length; i++) {
-        const line = lines[i];
-        if (isNoiseLine(line)) continue;
-        commentParts.push(line);
-      }
-
-      let commentText = commentParts.join(' ').trim();
-      if (!commentText) {
-        const nonNoise = lines.filter(line => !isNoiseLine(line));
-        commentText = nonNoise.slice(1).join(' ').trim() || nonNoise[0] || '';
-      }
-
-      commentText = commentText.replace(/^[:\-–—]+/, '').trim();
       const profilePath = profileLink?.getAttribute('href') || '';
-
-      if (!username || !commentText) continue;
-      if (normalize(commentText) === normalize(username)) continue;
-      if (normalize(commentText) === normalize(profilePath)) continue;
+      const parsed = parseRow(el, username, profilePath);
+      if (!username || !parsed.commentText) continue;
+      if (parsed.profileCount !== 1 || parsed.timeCount < 1 || parsed.lineCount < 2 || parsed.lineCount > 15) continue;
+      if (normalize(parsed.commentText) === normalize(username)) continue;
+      if (normalize(parsed.commentText) === normalize(profilePath)) continue;
 
       pushRow(el, username, profilePath, 'fallback');
     }
@@ -803,6 +810,7 @@ async function extractVisibleComments(root) {
     return rows;
   });
 }
+
 
 async function clickMoreComments(root) {
   return root.evaluate(rootEl => {
@@ -965,6 +973,9 @@ async function findCommentRow(root, target, page) {
         return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(v);
       };
 
+      const profileCountFor = el => Array.from(el.querySelectorAll('a[href^="/"]'))
+        .filter(a => validProfileHref(a.getAttribute('href'))).length;
+
       const isNoiseLine = line => {
         const t = normalize(line);
         if (!t) return true;
@@ -983,17 +994,28 @@ async function findCommentRow(root, target, page) {
 
       const scoreRow = row => {
         const txt = normalize(row.innerText || '');
-        if (!txt || txt.length > 1400) return null;
+        if (!txt || txt.length > 1200) return null;
         if (!txt.includes(targetUsername) || !txt.includes(targetCommentText)) return null;
-        const profileLink = Array.from(row.querySelectorAll('a[href^="/"]')).find(a => validProfileHref(a.getAttribute('href')));
-        if (targetProfilePath && profileLink && (profileLink.getAttribute('href') || '') !== targetProfilePath) return null;
+
+        const profileLinks = Array.from(row.querySelectorAll('a[href^="/"]'))
+          .filter(a => validProfileHref(a.getAttribute('href')));
+        if (profileLinks.length !== 1) return null;
+
+        const profileLink = profileLinks[0];
+        if (targetProfilePath && (profileLink.getAttribute('href') || '') !== targetProfilePath) return null;
+
+        const timeCount = row.querySelectorAll('time').length;
+        const lineCount = (row.innerText || '').split(/\n+/).map(x => x.trim()).filter(Boolean).length;
+        if (timeCount < 1 || lineCount < 2 || lineCount > 15) return null;
+
         const hasSignals = row.querySelector('time') || /\bReply\b|پاسخ/i.test(txt) || row.querySelector('button,[role="button"]');
         if (!hasSignals) return null;
+
         let score = 0;
         score += row.querySelector('time') ? 20 : 0;
         score += /\bReply\b|پاسخ/i.test(txt) ? 18 : 0;
         score += row.querySelector('button,[role="button"]') ? 10 : 0;
-        score += Math.max(0, 50 - txt.length / 30);
+        score += Math.max(0, 60 - txt.length / 18);
         score -= isNoiseLine(txt) ? 30 : 0;
         return { row, score };
       };
@@ -1006,9 +1028,13 @@ async function findCommentRow(root, target, page) {
         if (targetProfilePath && (link.getAttribute('href') || '') !== targetProfilePath) continue;
 
         let node = link;
-        for (let level = 0; level < 12 && node && node !== rootEl; level++) {
+        for (let level = 0; level < 10 && node && node !== rootEl; level++) {
           node = node.parentElement;
           if (!node) break;
+          const txt = (node.innerText || '').trim();
+          if (!txt || txt.length > 1200) continue;
+          const ntext = normalize(txt);
+          if (!ntext.includes(targetUsername) || !ntext.includes(targetCommentText)) continue;
           const scored = scoreRow(node);
           if (scored) {
             candidates.push(scored);
@@ -1018,7 +1044,7 @@ async function findCommentRow(root, target, page) {
       }
 
       if (!candidates.length) {
-        for (const el of Array.from(rootEl.querySelectorAll('article, li, [role="article"], div'))) {
+        for (const el of Array.from(rootEl.querySelectorAll('article, li, [role="article"], [data-testid], div'))) {
           const scored = scoreRow(el);
           if (scored) candidates.push(scored);
         }
@@ -1038,17 +1064,38 @@ async function findCommentRow(root, target, page) {
   throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 }
 
+
 async function sendReply(page, row, replyText) {
-  const clicked = await row.evaluate(node => {
-    const controls = Array.from(node.querySelectorAll('button,[role="button"],span,div'));
-    const reply = controls.find(el => {
-      const t = `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
-      return /^(reply|پاسخ)$/i.test(t) || /\breply\b/i.test(t) || /پاسخ/i.test(t);
+  const rowLocator = page.locator('[data-ig-target-row="1"]').first();
+
+  const replyCandidates = [
+    rowLocator.getByRole('button', { name: /^(Reply|پاسخ)$/i }).first(),
+    rowLocator.getByText(/^(Reply|پاسخ)$/i).first(),
+    rowLocator.locator('button,[role="button"]').filter({ hasText: /Reply|پاسخ/i }).first(),
+    rowLocator.locator('span,div,a').filter({ hasText: /^(Reply|پاسخ)$/i }).first()
+  ];
+
+  let clicked = false;
+  for (const candidate of replyCandidates) {
+    if (!(await candidate.isVisible().catch(() => false))) continue;
+    await candidate.scrollIntoViewIfNeeded().catch(() => {});
+    await candidate.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
+    clicked = true;
+    break;
+  }
+
+  if (!clicked) {
+    clicked = await row.evaluate(node => {
+      const controls = Array.from(node.querySelectorAll('button,[role="button"],span,div,a'));
+      const reply = controls.find(el => {
+        const t = `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
+        return /^(reply|پاسخ)$/i.test(t) || /\breply\b/i.test(t) || /پاسخ/i.test(t);
+      });
+      if (!reply) return false;
+      reply.click();
+      return true;
     });
-    if (!reply) return false;
-    reply.click();
-    return true;
-  });
+  }
 
   if (!clicked) throw new Error('REPLY_BUTTON_NOT_FOUND');
 
@@ -1119,6 +1166,7 @@ async function sendReply(page, row, replyText) {
     throw new Error('REPLY_NOT_CONFIRMED');
   }
 }
+
 
 async function sendDM(dmPage, profilePath, username, message) {
   const origin = new URL(dmPage.url()).origin;

@@ -1066,39 +1066,113 @@ async function findCommentRow(root, target, page) {
 
 
 async function sendReply(page, row, replyText) {
-  const rowLocator = page.locator('[data-ig-target-row="1"]').first();
+  if (!row) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 
-  const replyCandidates = [
-    rowLocator.getByRole('button', { name: /^(Reply|پاسخ)$/i }).first(),
-    rowLocator.getByText(/^(Reply|پاسخ)$/i).first(),
-    rowLocator.locator('button,[role="button"]').filter({ hasText: /Reply|پاسخ/i }).first(),
-    rowLocator.locator('span,div,a').filter({ hasText: /^(Reply|پاسخ)$/i }).first()
-  ];
+  await row.scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(250);
 
-  let clicked = false;
-  for (const candidate of replyCandidates) {
-    if (!(await candidate.isVisible().catch(() => false))) continue;
-    await candidate.scrollIntoViewIfNeeded().catch(() => {});
-    await candidate.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
-    clicked = true;
-    break;
-  }
+  const replyTarget = await row.evaluate((rowEl) => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-  if (!clicked) {
-    clicked = await row.evaluate(node => {
-      const controls = Array.from(node.querySelectorAll('button,[role="button"],span,div,a'));
-      const reply = controls.find(el => {
-        const t = `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
-        return /^(reply|پاسخ)$/i.test(t) || /\breply\b/i.test(t) || /پاسخ/i.test(t);
+    const isVisible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.right > 0 &&
+        r.bottom > 0 &&
+        r.left < innerWidth &&
+        r.top < innerHeight
+      );
+    };
+
+    const textFor = el => `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
+    const isReplyLabel = el => {
+      const t = normalize(textFor(el));
+      return /^(reply|پاسخ)$/i.test(t) || /\breply\b/i.test(t) || /پاسخ/i.test(t);
+    };
+
+    const rowRect = rowEl.getBoundingClientRect();
+    const collected = [];
+
+    const scoreCandidate = (el, source) => {
+      if (!isVisible(el) || !isReplyLabel(el)) return;
+      const r = el.getBoundingClientRect();
+      const text = normalize(textFor(el));
+      let score = 0;
+      score += /^(reply|پاسخ)$/i.test(text) ? 25 : 0;
+      score += /button|role="button"/i.test(`${el.tagName} ${el.getAttribute('role') || ''}`) ? 10 : 0;
+      score += Math.max(0, 180 - Math.abs((r.top + r.height / 2) - (rowRect.bottom + 18)));
+      score += r.left < rowRect.left + 220 ? 18 : 0;
+      score += source === 'descendant' ? 8 : 0;
+      score += source === 'ancestor' ? 4 : 0;
+      collected.push({
+        el,
+        score,
+        text,
+        source,
+        rect: {
+          left: r.left,
+          top: r.top,
+          width: r.width,
+          height: r.height,
+          centerX: r.left + r.width / 2,
+          centerY: r.top + r.height / 2
+        }
       });
-      if (!reply) return false;
-      reply.click();
-      return true;
-    });
-  }
+    };
 
-  if (!clicked) throw new Error('REPLY_BUTTON_NOT_FOUND');
+    let scope = rowEl;
+    for (let depth = 0; depth < 5 && scope; depth++) {
+      for (const el of Array.from(scope.querySelectorAll('button,[role="button"],a,span,div'))) {
+        scoreCandidate(el, depth === 0 ? 'descendant' : 'ancestor');
+      }
+      scope = scope.parentElement;
+    }
 
+    if (!collected.length) {
+      for (const el of Array.from(document.querySelectorAll('button,[role="button"],a,span,div'))) {
+        if (!isVisible(el) || !isReplyLabel(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.bottom < rowRect.top - 40 || r.top > rowRect.bottom + 240) continue;
+        scoreCandidate(el, 'global');
+      }
+    }
+
+    if (!collected.length) return null;
+    collected.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+    const best = collected[0];
+    best.el.setAttribute('data-ig-reply-target', '1');
+    return {
+      score: best.score,
+      source: best.source,
+      text: best.text,
+      rect: best.rect
+    };
+  });
+
+  if (!replyTarget) throw new Error('REPLY_BUTTON_NOT_FOUND');
+
+  const replyLocator = page.locator('[data-ig-reply-target="1"]').last();
+  await replyLocator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async () => {
+    await replyLocator.evaluate(el => el.click()).catch(() => {});
+  });
   await page.waitForTimeout(500);
 
   const inputs = [
@@ -1166,6 +1240,7 @@ async function sendReply(page, row, replyText) {
     throw new Error('REPLY_NOT_CONFIRMED');
   }
 }
+
 
 
 async function sendDM(dmPage, profilePath, username, message) {

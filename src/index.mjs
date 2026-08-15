@@ -586,6 +586,8 @@ async function extractVisibleComments(root) {
       .replace(/\s+/g, ' ')
       .trim();
 
+    const compact = value => normalize(value).replace(/\s+/g, '');
+
     const validProfileHref = href => {
       const v = String(href || '');
       if (!/^\/[^/]+\/?$/.test(v)) return false;
@@ -597,48 +599,106 @@ async function extractVisibleComments(root) {
       if (!t) return true;
       if (/^(reply|like|likes?)$/i.test(t)) return true;
       if (/^(add a comment|view insights|boost post|send message|message|send|post|cancel|close|ok|got it)$/i.test(t)) return true;
+      if (/^(view all \d+ replies|view hidden comments|load more comments|view more comments|view all comments)$/i.test(t)) return true;
       if (/^\d+([smhdw])$/i.test(t)) return true;
       if (/^\d+([,.]\d+)*$/.test(t)) return true;
       if (/^\d{1,2}:\d{2}$/.test(t)) return true;
       return false;
     };
 
-    const pickCommentText = (row, username, profilePath) => {
-      const text = (row.innerText || '').trim();
-      const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-      const usernameNorm = normalize(username);
-      const out = [];
-      let seenUsername = false;
+    const commonCommentSignals = txt => {
+      const n = normalize(txt);
+      return (
+        /\bReply\b|پاسخ/i.test(n) ||
+        /\bLike\b|پسندیدن/i.test(n) ||
+        /\btime\b/i.test(n) ||
+        /\bview all \d+ replies\b/i.test(n) ||
+        /\bview hidden comments\b/i.test(n)
+      );
+    };
+
+    const parseRow = (row, usernameHint = '', profilePathHint = '') => {
+      const rowText = (row.innerText || '').trim();
+      const lines = rowText.split(/\n+/).map(x => x.trim()).filter(Boolean);
+      const usernameNorm = normalize(usernameHint);
+      const profileNorm = normalize(profilePathHint.replace(/^\//, ''));
+
+      let username = usernameHint || '';
+      let started = !usernameNorm;
+      const content = [];
+      let time = row.querySelector('time')?.textContent?.trim() || '';
+
       for (const line of lines) {
         const n = normalize(line);
-        if (!seenUsername && n === usernameNorm) {
-          seenUsername = true;
+        if (!started) {
+          if (n === usernameNorm || n === profileNorm) {
+            started = true;
+          }
           continue;
         }
-        if (n === usernameNorm) continue;
         if (isNoiseLine(line)) continue;
         if (/^(reply|پاسخ|like|پسندیدن)$/i.test(n)) continue;
-        out.push(line);
+        if (!username && line.length <= 40 && !/\s/.test(line) && !/^[\d:./-]+$/.test(line)) {
+          username = line;
+          continue;
+        }
+        content.push(line);
       }
-      let commentText = out.join(' ').trim();
+
+      if (!username) {
+        const headerLine = lines.find(line => !isNoiseLine(line) && line.length <= 40 && !/\s/.test(line));
+        if (headerLine) username = headerLine;
+      }
+
+      let commentText = content.join(' ').trim();
       if (!commentText) {
         const candidate = lines
           .filter(line => !isNoiseLine(line))
-          .find(line => normalize(line) !== usernameNorm);
+          .find(line => normalize(line) !== normalize(username));
         commentText = candidate || '';
       }
-      commentText = commentText
-        .replace(/^[:\-–—]+/, '')
-        .trim();
-      if (commentText === username || normalize(commentText) === usernameNorm) return '';
-      if (normalize(commentText) === normalize(profilePath)) return '';
-      return commentText;
+
+      commentText = commentText.replace(/^[:\-–—]+/, '').trim();
+      return {
+        username,
+        time,
+        rowText,
+        commentText,
+        hasReply: commonCommentSignals(rowText),
+        hasTime: !!row.querySelector('time'),
+        hasControl: !!row.querySelector('button,[role="button"]')
+      };
     };
 
     const rows = [];
     const seen = new Set();
-    const links = Array.from(rootEl.querySelectorAll('a[href^="/"]')).filter(a => validProfileHref(a.getAttribute('href')));
 
+    const pushRow = (row, username, profilePath, source) => {
+      const parsed = parseRow(row, username, profilePath);
+      const cleanUsername = normalize(parsed.username);
+      const cleanComment = normalize(parsed.commentText);
+      if (!cleanUsername || !cleanComment) return false;
+      if (/^(reply|پاسخ|like|پسندیدن|view all|view hidden comments|load more comments|view more comments)$/i.test(cleanComment)) return false;
+      const key = `${compact(profilePath)}|${compact(cleanUsername)}|${compact(cleanComment)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      rows.push({
+        username: parsed.username,
+        profilePath,
+        commentText: parsed.commentText,
+        time: parsed.time,
+        rowText: parsed.rowText,
+        key,
+        source,
+        hasReply: parsed.hasReply,
+        hasTime: parsed.hasTime,
+        hasControl: parsed.hasControl
+      });
+      return true;
+    };
+
+    // Pass 1: profile-link anchored extraction.
+    const links = Array.from(rootEl.querySelectorAll('a[href^="/"]')).filter(a => validProfileHref(a.getAttribute('href')));
     for (const link of links) {
       const username = (link.textContent || '').trim();
       if (!username) continue;
@@ -651,37 +711,93 @@ async function extractVisibleComments(root) {
         if (!node) break;
 
         const txt = (node.innerText || '').trim();
-        if (!txt || txt.length > 1200) continue;
+        if (!txt || txt.length > 1400) continue;
         const ntext = normalize(txt);
         if (!ntext.includes(normalize(username))) continue;
-        const hasSignals = node.querySelector('time') || /\bReply\b|پاسخ/i.test(ntext) || node.querySelector('button,[role="button"]');
-        if (!hasSignals) continue;
+        if (!commonCommentSignals(ntext) && !node.querySelector('time')) continue;
 
         row = node;
         break;
       }
 
       if (!row) continue;
+      pushRow(row, username, profilePath, 'anchor');
+    }
 
-      const time = row.querySelector('time')?.textContent?.trim() || '';
-      const commentText = pickCommentText(row, username, profilePath);
-      const rowText = (row.innerText || '').trim();
-      if (!commentText) continue;
-      const key = `${compactText(profilePath)}|${compactText(username)}|${compactText(commentText)}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+    if (rows.length >= 1) return rows;
 
-      rows.push({
-        username,
-        profilePath,
-        commentText,
-        time,
-        rowText,
-        key,
-        hasReply: /\bReply\b|پاسخ/i.test(normalize(rowText)),
-        hasTime: !!row.querySelector('time'),
-        hasControl: !!row.querySelector('button,[role="button"]')
+    // Pass 2: structural fallback for desktop comments where links are not usable.
+    const descendants = Array.from(rootEl.querySelectorAll('article, li, [role="article"], [data-testid], div'))
+      .filter(el => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        if (
+          s.display === 'none' ||
+          s.visibility === 'hidden' ||
+          r.width <= 0 ||
+          r.height <= 0 ||
+          r.right <= 0 ||
+          r.bottom <= 0 ||
+          r.left >= innerWidth ||
+          r.top >= innerHeight
+        ) {
+          return false;
+        }
+        const text = (el.innerText || '').trim();
+        if (text.length < 12 || text.length > 1200) return false;
+        if (/^(reply|like|save|share|view all|view hidden comments|add a comment)$/i.test(normalize(text))) return false;
+        return commonCommentSignals(text) || !!el.querySelector('time') || !!el.querySelector('a[href^="/"]');
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return ar.height - br.height || ar.width - br.width;
       });
+
+    for (const el of descendants) {
+      const text = (el.innerText || '').trim();
+      const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+      if (!lines.length) continue;
+
+      const time = el.querySelector('time')?.textContent?.trim() || '';
+      const profileLink = Array.from(el.querySelectorAll('a[href^="/"]')).find(a => validProfileHref(a.getAttribute('href')));
+      const username = profileLink?.textContent?.trim() || lines.find(line => {
+        const n = normalize(line);
+        return !isNoiseLine(line) && line.length <= 40 && !/\s/.test(line) && !/^\d/.test(n);
+      }) || '';
+
+      let commentStart = -1;
+      if (profileLink) {
+        const profileNorm = normalize(profileLink.textContent || '');
+        commentStart = lines.findIndex(line => normalize(line) === profileNorm);
+      }
+      if (commentStart < 0 && username) {
+        const usernameNorm = normalize(username);
+        commentStart = lines.findIndex(line => normalize(line) === usernameNorm);
+      }
+      if (commentStart < 0) commentStart = 0;
+
+      const commentParts = [];
+      for (let i = commentStart + 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (isNoiseLine(line)) continue;
+        commentParts.push(line);
+      }
+
+      let commentText = commentParts.join(' ').trim();
+      if (!commentText) {
+        const nonNoise = lines.filter(line => !isNoiseLine(line));
+        commentText = nonNoise.slice(1).join(' ').trim() || nonNoise[0] || '';
+      }
+
+      commentText = commentText.replace(/^[:\-–—]+/, '').trim();
+      const profilePath = profileLink?.getAttribute('href') || '';
+
+      if (!username || !commentText) continue;
+      if (normalize(commentText) === normalize(username)) continue;
+      if (normalize(commentText) === normalize(profilePath)) continue;
+
+      pushRow(el, username, profilePath, 'fallback');
     }
 
     return rows;
@@ -849,32 +965,67 @@ async function findCommentRow(root, target, page) {
         return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(v);
       };
 
+      const isNoiseLine = line => {
+        const t = normalize(line);
+        if (!t) return true;
+        if (/^(reply|like|likes?)$/i.test(t)) return true;
+        if (/^(add a comment|view insights|boost post|send message|message|send|post|cancel|close|ok|got it)$/i.test(t)) return true;
+        if (/^(view all \d+ replies|view hidden comments|load more comments|view more comments|view all comments)$/i.test(t)) return true;
+        if (/^\d+([smhdw])$/i.test(t)) return true;
+        if (/^\d+([,.]\d+)*$/.test(t)) return true;
+        if (/^\d{1,2}:\d{2}$/.test(t)) return true;
+        return false;
+      };
+
       const targetUsername = normalize(targetComment.username);
       const targetCommentText = normalize(targetComment.commentText);
       const targetProfilePath = targetComment.profilePath || '';
 
-      const links = Array.from(rootEl.querySelectorAll('a[href^="/"]')).filter(a => validProfileHref(a.getAttribute('href')));
+      const scoreRow = row => {
+        const txt = normalize(row.innerText || '');
+        if (!txt || txt.length > 1400) return null;
+        if (!txt.includes(targetUsername) || !txt.includes(targetCommentText)) return null;
+        const profileLink = Array.from(row.querySelectorAll('a[href^="/"]')).find(a => validProfileHref(a.getAttribute('href')));
+        if (targetProfilePath && profileLink && (profileLink.getAttribute('href') || '') !== targetProfilePath) return null;
+        const hasSignals = row.querySelector('time') || /\bReply\b|پاسخ/i.test(txt) || row.querySelector('button,[role="button"]');
+        if (!hasSignals) return null;
+        let score = 0;
+        score += row.querySelector('time') ? 20 : 0;
+        score += /\bReply\b|پاسخ/i.test(txt) ? 18 : 0;
+        score += row.querySelector('button,[role="button"]') ? 10 : 0;
+        score += Math.max(0, 50 - txt.length / 30);
+        score -= isNoiseLine(txt) ? 30 : 0;
+        return { row, score };
+      };
+
       const candidates = [];
 
+      const links = Array.from(rootEl.querySelectorAll('a[href^="/"]')).filter(a => validProfileHref(a.getAttribute('href')));
       for (const link of links) {
         if (normalize(link.textContent || '') !== targetUsername) continue;
         if (targetProfilePath && (link.getAttribute('href') || '') !== targetProfilePath) continue;
 
         let node = link;
-        for (let level = 0; level < 10 && node && node !== rootEl; level++) {
+        for (let level = 0; level < 12 && node && node !== rootEl; level++) {
           node = node.parentElement;
           if (!node) break;
-          const txt = normalize(node.innerText || '');
-          if (!txt.includes(targetUsername)) continue;
-          if (!txt.includes(targetCommentText)) continue;
-          if (!node.querySelector('time') && !/\bReply\b|پاسخ/i.test(txt)) continue;
-          candidates.push(node);
-          break;
+          const scored = scoreRow(node);
+          if (scored) {
+            candidates.push(scored);
+            break;
+          }
+        }
+      }
+
+      if (!candidates.length) {
+        for (const el of Array.from(rootEl.querySelectorAll('article, li, [role="article"], div'))) {
+          const scored = scoreRow(el);
+          if (scored) candidates.push(scored);
         }
       }
 
       if (!candidates.length) return null;
-      const best = candidates.sort((a, b) => (a.innerText || '').length - (b.innerText || '').length)[0];
+      const best = candidates.sort((a, b) => b.score - a.score || (a.row.innerText || '').length - (b.row.innerText || '').length)[0].row;
       best.setAttribute('data-ig-target-row', '1');
       return best;
     }, target);

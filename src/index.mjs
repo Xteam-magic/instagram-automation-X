@@ -11,12 +11,16 @@ const MAX_SCAN_ROUNDS = Number(
   env.INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS || 120
 );
 
-const SCROLL_PIXELS = Number(
-  env.INSTAGRAM_COMMENT_SCROLL_PIXELS || 600
+const COMMENT_SCROLL_STEP = Number(
+  env.INSTAGRAM_COMMENT_SCROLL_PIXELS || 500
 );
 
-const SCROLL_WAIT_MS = Number(
-  env.INSTAGRAM_COMMENT_SCROLL_WAIT_MS || 1000
+const COMMENT_SCROLL_WAIT = Number(
+  env.INSTAGRAM_COMMENT_SCROLL_WAIT_MS || 900
+);
+
+const COMMENT_PANEL_WAIT = Number(
+  env.INSTAGRAM_COMMENT_PANEL_WAIT_MS || 1200
 );
 
 function now() {
@@ -27,7 +31,9 @@ function required(name) {
   const value = env[name]?.trim();
 
   if (!value) {
-    throw new Error(`Missing required input: ${name}`);
+    throw new Error(
+      `Missing required input: ${name}`
+    );
   }
 
   return value;
@@ -57,7 +63,8 @@ function normalizeText(value) {
 }
 
 function compactText(value) {
-  return normalizeText(value).replace(/\s+/g, '');
+  return normalizeText(value)
+    .replace(/\s+/g, '');
 }
 
 function distance(a, b) {
@@ -96,31 +103,41 @@ function typoThreshold(word) {
   if (n <= 8) return 2;
   if (n <= 12) return 3;
 
-  return Math.max(3, Math.floor(n * 0.25));
+  return Math.max(
+    3,
+    Math.floor(n * 0.25)
+  );
 }
 
 function keywordMatch(text, keywords) {
   const normalized = normalizeText(text);
   const compact = compactText(text);
-  const words = normalized.split(/\s+/).filter(Boolean);
+
+  const words =
+    normalized
+      .split(/\s+/)
+      .filter(Boolean);
 
   for (const rawKeyword of keywords) {
-    const keyword = normalizeText(rawKeyword);
+    const keyword =
+      normalizeText(rawKeyword);
 
     if (!keyword) continue;
 
-    const compactKeyword = compactText(keyword);
+    const keywordCompact =
+      compactText(keyword);
 
     /*
-     * Exact:
+     * Exact match anywhere in the comment.
      *
-     * "تبریک"
-     * "تبریک خیلی زیاد"
-     * "سلام تبریک"
+     * Example:
+     * تبریک
+     * خیلی تبریک میگم
+     * تبریک بابت موفقیت
      */
     if (
       normalized.includes(keyword) ||
-      compact.includes(compactKeyword)
+      compact.includes(keywordCompact)
     ) {
       return {
         matched: true,
@@ -130,21 +147,27 @@ function keywordMatch(text, keywords) {
       };
     }
 
-    /*
-     * Fuzzy single word.
-     */
-    const targetWords = keyword
-      .split(/\s+/)
-      .filter(Boolean);
+    const targetWords =
+      keyword
+        .split(/\s+/)
+        .filter(Boolean);
 
+    /*
+     * Single word fuzzy.
+     */
     if (targetWords.length === 1) {
-      const target = targetWords[0];
-      const threshold = typoThreshold(target);
+      const target =
+        targetWords[0];
+
+      const threshold =
+        typoThreshold(target);
 
       for (const word of words) {
         if (
-          Math.abs(word.length - target.length) <=
-          threshold
+          Math.abs(
+            word.length -
+              target.length
+          ) <= threshold
         ) {
           if (
             word.includes(target) ||
@@ -153,18 +176,27 @@ function keywordMatch(text, keywords) {
             return {
               matched: true,
               keyword: rawKeyword,
-              mode: 'substring-typo',
-              distance: Math.abs(
-                word.length - target.length
-              )
+              mode:
+                'substring-typo',
+              distance:
+                Math.abs(
+                  word.length -
+                    target.length
+                )
             };
           }
         }
 
         if (threshold > 0) {
-          const d = distance(word, target);
+          const d =
+            distance(
+              word,
+              target
+            );
 
-          if (d <= threshold) {
+          if (
+            d <= threshold
+          ) {
             return {
               matched: true,
               keyword: rawKeyword,
@@ -179,27 +211,47 @@ function keywordMatch(text, keywords) {
     }
 
     /*
-     * Fuzzy multi-word.
+     * Multi-word fuzzy.
      */
     for (
       let start = 0;
-      start <= words.length - targetWords.length;
+      start <=
+        words.length -
+          targetWords.length;
       start++
     ) {
       let ok = true;
       let totalDistance = 0;
 
-      for (let i = 0; i < targetWords.length; i++) {
-        const word = words[start + i];
-        const target = targetWords[i];
+      for (
+        let i = 0;
+        i < targetWords.length;
+        i++
+      ) {
+        const word =
+          words[start + i];
 
-        if (word === target) {
+        const target =
+          targetWords[i];
+
+        if (
+          word === target
+        ) {
           continue;
         }
 
-        const d = distance(word, target);
+        const d =
+          distance(
+            word,
+            target
+          );
 
-        if (d > typoThreshold(target)) {
+        if (
+          d >
+          typoThreshold(
+            target
+          )
+        ) {
           ok = false;
           break;
         }
@@ -212,7 +264,8 @@ function keywordMatch(text, keywords) {
           matched: true,
           keyword: rawKeyword,
           mode: 'phrase-typo',
-          distance: totalDistance
+          distance:
+            totalDistance
         };
       }
     }
@@ -227,7 +280,7 @@ function appendLog(
   message,
   data = {}
 ) {
-  const line = {
+  const event = {
     time: now(),
     message,
     ...data
@@ -238,12 +291,13 @@ function appendLog(
       ARTIFACTS,
       'automation.log'
     ),
-    JSON.stringify(line) + '\n',
+    JSON.stringify(event) +
+      '\n',
     'utf8'
   );
 
   console.log(
-    `[${line.time}] ${message}`,
+    `[${event.time}] ${message}`,
     Object.keys(data).length
       ? data
       : ''
@@ -285,60 +339,9 @@ async function safeClick(
   }
 }
 
-async function clickText(
-  page,
-  patterns,
-  timeout = 3000
+async function dismissCommonPopups(
+  page
 ) {
-  for (const pattern of patterns) {
-    const candidates = [
-      page
-        .getByRole(
-          'button',
-          {
-            name: pattern
-          }
-        )
-        .first(),
-
-      page
-        .getByRole(
-          'link',
-          {
-            name: pattern
-          }
-        )
-        .first(),
-
-      page
-        .getByText(
-          pattern
-        )
-        .first()
-    ];
-
-    for (const candidate of candidates) {
-      if (
-        await candidate
-          .isVisible()
-          .catch(() => false)
-      ) {
-        if (
-          await safeClick(
-            candidate,
-            timeout
-          )
-        ) {
-          return true;
-        }
-      }
-    }
-  }
-
-  return false;
-}
-
-async function dismissCommonPopups(page) {
   const patterns = [
     'Not now',
     'Not Now',
@@ -354,10 +357,16 @@ async function dismissCommonPopups(page) {
     'باشه'
   ];
 
-  for (const text of patterns) {
-    await clickText(
-      page,
-      [text],
+  for (
+    const text of patterns
+  ) {
+    await safeClick(
+      page.getByText(
+        text,
+        {
+          exact: true
+        }
+      ),
       700
     );
   }
@@ -403,9 +412,9 @@ async function login(
   );
 
   if (
-    page.url().includes(
-      '/accounts/login'
-    )
+    page
+      .url()
+      .includes('/accounts/login')
   ) {
     if (
       !env.INSTAGRAM_USERNAME ||
@@ -432,14 +441,17 @@ async function login(
         env.INSTAGRAM_PASSWORD
       );
 
-    await clickText(
-      page,
-      [
-        'Log in',
-        'ورود'
-      ],
-      8000
-    );
+    await page
+      .getByRole(
+        'button',
+        {
+          name:
+            /Log in|ورود/i
+        }
+      )
+      .click({
+        timeout: 8000
+      });
 
     await page.waitForTimeout(
       4000
@@ -464,276 +476,931 @@ async function login(
   });
 }
 
+/* =========================================================
+   POST ACTION BAR
+   ========================================================= */
+
 /**
- * مهم:
- *
- * در Instagram Web دسکتاپ،
- * پنل کامنت این پست داخل سمت راست صفحه است
- * و الزاماً role=dialog ندارد.
- *
- * بنابراین پنل را بر اساس:
- *
- * - position در سمت راست
- * - scrollable بودن
- * - ارتفاع مناسب
- * - scrollHeight
- * - وجود Add a comment / View insights
- *
- * پیدا می‌کنیم.
+ * جمع‌آوری تمام button-like های قابل مشاهده
+ * برای پیدا کردن Action Bar واقعی پست.
  */
-async function findWebCommentPanel(
+async function inspectActionButtons(
   page
 ) {
   return page.evaluate(() => {
-    const viewportWidth =
+    const vw =
       window.innerWidth;
 
-    const all =
+    const vh =
+      window.innerHeight;
+
+    const nodes =
       Array.from(
         document.querySelectorAll(
-          'body *'
+          'button,[role="button"],a'
         )
       );
 
-    const candidates = [];
+    return nodes
+      .map(
+        (el, index) => {
+          const rect =
+            el.getBoundingClientRect();
 
-    for (const element of all) {
-      const style =
-        getComputedStyle(
-          element
-        );
+          const style =
+            getComputedStyle(
+              el
+            );
 
-      const rect =
-        element.getBoundingClientRect();
+          const svg =
+            el.querySelector(
+              'svg'
+            );
 
-      if (
-        rect.width < 260 ||
-        rect.width > 550
-      ) {
-        continue;
-      }
+          const aria =
+            el.getAttribute(
+              'aria-label'
+            ) || '';
 
-      if (
-        rect.height < 220
-      ) {
-        continue;
-      }
+          const title =
+            el.getAttribute(
+              'title'
+            ) || '';
 
-      if (
-        rect.x <
-        viewportWidth * 0.50
-      ) {
-        continue;
-      }
+          const text =
+            (
+              el.innerText ||
+              ''
+            ).trim();
 
-      if (
-        !/(auto|scroll)/.test(
-          style.overflowY
-        )
-      ) {
-        continue;
-      }
+          const visible =
+            style.display !== 'none' &&
+            style.visibility !==
+              'hidden' &&
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.right > 0 &&
+            rect.bottom > 0 &&
+            rect.left < vw &&
+            rect.top < vh;
 
-      if (
-        element.scrollHeight <=
-        element.clientHeight + 50
-      ) {
-        continue;
-      }
+          if (!visible) {
+            return null;
+          }
 
-      const text =
-        element.innerText || '';
+          return {
+            index,
 
-      let score = 0;
+            tag:
+              el.tagName,
 
-      if (
-        /Add a comment/i.test(
-          text
-        )
-      ) {
-        score += 20;
-      }
+            role:
+              el.getAttribute(
+                'role'
+              ),
 
-      if (
-        /View insights/i.test(
-          text
-        )
-      ) {
-        score += 10;
-      }
+            aria,
 
-      if (
-        /Boost post/i.test(
-          text
-        )
-      ) {
-        score += 5;
-      }
+            title,
 
-      if (
-        rect.x >
-        viewportWidth * 0.58
-      ) {
-        score += 5;
-      }
+            text:
+              text.slice(
+                0,
+                120
+              ),
 
-      if (
-        element.scrollHeight >
-        800
-      ) {
-        score += 5;
-      }
+            hasSvg:
+              Boolean(svg),
 
-      candidates.push({
-        element,
-        score,
-        rect: {
-          x: rect.x,
-          y: rect.y,
-          width: rect.width,
-          height: rect.height
-        },
-        scrollTop:
-          element.scrollTop,
-        scrollHeight:
-          element.scrollHeight,
-        clientHeight:
-          element.clientHeight
-      });
-    }
+            html:
+              el.outerHTML.slice(
+                0,
+                1200
+              ),
 
-    candidates.sort(
-      (a, b) =>
-        b.score - a.score
-    );
+            rect: {
+              left:
+                rect.left,
 
-    if (!candidates.length) {
-      return null;
-    }
+              top:
+                rect.top,
 
-    const best =
-      candidates[0];
+              width:
+                rect.width,
 
-    /*
-     * یک index پایدار در querySelectorAll
-     * برای استفاده در همان لحظه.
-     */
-    const index =
-      all.indexOf(
-        best.element
-      );
+              height:
+                rect.height,
 
-    return {
-      index,
-      ...best,
-      candidateCount:
-        candidates.length
-    };
+              right:
+                rect.right,
+
+              bottom:
+                rect.bottom,
+
+              centerX:
+                rect.left +
+                rect.width / 2,
+
+              centerY:
+                rect.top +
+                rect.height / 2
+            }
+          };
+        }
+      )
+      .filter(Boolean);
   });
 }
 
 /**
- * اسکرول مستقیم همان پنل سمت راست.
+ * پیدا کردن Comment button واقعی:
+ *
+ * 1) aria-label / title
+ * 2) SVG metadata
+ * 3) تشخیص Action Bar
+ *
+ * Action Bar می‌تواند:
+ *
+ * horizontal:
+ * Like | Comment | Repost | Send | Save
+ *
+ * یا vertical:
+ * Like
+ * Comment
+ * Repost
+ * Send
+ * Save
  */
-async function scrollWebCommentPanel(
-  page,
-  amount
+async function findCommentActionButton(
+  page
 ) {
-  return page.evaluate(
-    pixels => {
-      const viewportWidth =
-        window.innerWidth;
+  const buttons =
+    await inspectActionButtons(
+      page
+    );
 
-      const all =
-        Array.from(
-          document.querySelectorAll(
-            'body *'
+  /*
+   * روش ۱:
+   * Accessibility مستقیم.
+   */
+  const direct =
+    buttons.find(
+      button =>
+        /comment|comments|نظر|دیدگاه/i.test(
+          `${button.aria} ${button.title}`
+        )
+    );
+
+  if (direct) {
+    return {
+      strategy:
+        'accessibility',
+      button:
+        direct
+    };
+  }
+
+  /*
+   * روش ۲:
+   * SVG دارای title / aria-label.
+   */
+  const svgDirect =
+    buttons.find(
+      button =>
+        button.hasSvg &&
+        /comment|comments|نظر|دیدگاه/i.test(
+          button.html
+        )
+    );
+
+  if (svgDirect) {
+    return {
+      strategy:
+        'svg-semantic',
+      button:
+        svgDirect
+    };
+  }
+
+  /*
+   * روش ۳:
+   *
+   * Action Bar را از روی geometry
+   * پیدا می‌کنیم.
+   *
+   * از 20% سمت چپ صفحه به بعد:
+   * navigation را حذف می‌کنیم.
+   *
+   * Message floating button را هم حذف می‌کنیم.
+   */
+  const candidates =
+    buttons.filter(
+      button => {
+        const r =
+          button.rect;
+
+        if (
+          !button.hasSvg
+        ) {
+          return false;
+        }
+
+        if (
+          r.left <
+          vwSafe(page, 200)
+        ) {
+          return false;
+        }
+
+        if (
+          r.width > 100 ||
+          r.height > 100
+        ) {
+          return false;
+        }
+
+        if (
+          r.top < 100 ||
+          r.bottom >
+            950
+        ) {
+          return false;
+        }
+
+        if (
+          /message|messages|follow|boost|close|more/i.test(
+            `${button.aria} ${button.title} ${button.text}`
           )
+        ) {
+          return false;
+        }
+
+        return true;
+      }
+    );
+
+  /*
+   * گروه‌های افقی/عمودی.
+   */
+  const groups = [];
+
+  for (
+    const button of candidates
+  ) {
+    const sameHorizontal =
+      groups.find(
+        group =>
+          group.orientation ===
+            'horizontal' &&
+          Math.abs(
+            group.anchorY -
+              button.rect.centerY
+          ) < 35
+      );
+
+    if (
+      sameHorizontal
+    ) {
+      sameHorizontal.items.push(
+        button
+      );
+
+      continue;
+    }
+
+    const sameVertical =
+      groups.find(
+        group =>
+          group.orientation ===
+            'vertical' &&
+          Math.abs(
+            group.anchorX -
+              button.rect.centerX
+          ) < 35
+      );
+
+    if (
+      sameVertical
+    ) {
+      sameVertical.items.push(
+        button
+      );
+
+      continue;
+    }
+
+    /*
+     * تعیین اولیه جهت:
+     * هنوز آیتم دیگری نداریم.
+     */
+    groups.push({
+      orientation:
+        'unknown',
+      anchorX:
+        button.rect.centerX,
+      anchorY:
+        button.rect.centerY,
+      items: [button]
+    });
+  }
+
+  /*
+   * گروه‌ها را با نزدیک‌ترین اعضا
+   * دوباره normalize می‌کنیم.
+   */
+  for (
+    const group of groups
+  ) {
+    if (
+      group.items.length >= 2
+    ) {
+      const xs =
+        group.items.map(
+          x =>
+            x.rect.centerX
         );
 
-      const candidates =
-        all.filter(
-          element => {
-            const style =
+      const ys =
+        group.items.map(
+          x =>
+            x.rect.centerY
+        );
+
+      const xSpan =
+        Math.max(...xs) -
+        Math.min(...xs);
+
+      const ySpan =
+        Math.max(...ys) -
+        Math.min(...ys);
+
+      group.orientation =
+        xSpan >= ySpan
+          ? 'horizontal'
+          : 'vertical';
+    }
+  }
+
+  const usableGroups =
+    groups
+      .filter(
+        group =>
+          group.items.length >=
+          4
+      )
+      .sort(
+        (a, b) =>
+          b.items.length -
+          a.items.length
+      );
+
+  if (
+    usableGroups.length
+  ) {
+    const group =
+      usableGroups[0];
+
+    const items =
+      group.items.slice();
+
+    if (
+      group.orientation ===
+      'horizontal'
+    ) {
+      items.sort(
+        (a, b) =>
+          a.rect.centerX -
+          b.rect.centerX
+      );
+    } else {
+      items.sort(
+        (a, b) =>
+          a.rect.centerY -
+          b.rect.centerY
+      );
+    }
+
+    /*
+     * استاندارد Action Bar اینستاگرام:
+     *
+     * 0 = Like
+     * 1 = Comment
+     *
+     * اگر حداقل 4 icon در action bar
+     * داریم، آیتم دوم را Comment می‌گیریم.
+     */
+    if (
+      items.length >= 4
+    ) {
+      return {
+        strategy:
+          `action-bar-${group.orientation}`,
+        button:
+          items[1],
+        actionBar:
+          items.map(
+            item => ({
+              x:
+                item.rect.centerX,
+              y:
+                item.rect.centerY,
+              aria:
+                item.aria,
+              title:
+                item.title
+            })
+          )
+      };
+    }
+  }
+
+  /*
+   * روش آخر:
+   * آیکون‌هایی که در سمت راست
+   * action area اصلی پست هستند.
+   */
+  const rightIcons =
+    candidates
+      .filter(
+        button =>
+          button.rect.centerX >
+          500
+      )
+      .sort(
+        (a, b) =>
+          a.rect.top -
+          b.rect.top
+      );
+
+  if (
+    rightIcons.length >= 4
+  ) {
+    /*
+     * ابتدا تلاش horizontal:
+     */
+    const minY =
+      Math.min(
+        ...rightIcons.map(
+          x =>
+            x.rect.centerY
+        )
+      );
+
+    const horizontal =
+      rightIcons
+        .filter(
+          x =>
+            Math.abs(
+              x.rect.centerY -
+                minY
+            ) < 40
+        )
+        .sort(
+          (a, b) =>
+            a.rect.left -
+            b.rect.left
+        );
+
+    if (
+      horizontal.length >= 4
+    ) {
+      return {
+        strategy:
+          'action-bar-horizontal-fallback',
+        button:
+          horizontal[1]
+      };
+    }
+
+    /*
+     * vertical:
+     */
+    const x0 =
+      rightIcons[0]
+        ?.rect
+        .centerX;
+
+    const vertical =
+      rightIcons
+        .filter(
+          x =>
+            Math.abs(
+              x.rect.centerX -
+                x0
+            ) < 40
+        )
+        .sort(
+          (a, b) =>
+            a.rect.top -
+            b.rect.top
+        );
+
+    if (
+      vertical.length >= 4
+    ) {
+      return {
+        strategy:
+          'action-bar-vertical-fallback',
+        button:
+          vertical[1]
+      };
+    }
+  }
+
+  return null;
+}
+
+function vwSafe(
+  page,
+  fallback
+) {
+  /*
+   * فقط برای فیلتر تقریبی.
+   * مقدار viewport فعلی ما 1440 است.
+   */
+  return fallback;
+}
+
+/**
+ * کلیک واقعی روی Comment icon.
+ */
+async function clickRealCommentIcon(
+  page
+) {
+  const found =
+    await findCommentActionButton(
+      page
+    );
+
+  if (!found) {
+    throw new Error(
+      'REAL_COMMENT_ICON_NOT_FOUND'
+    );
+  }
+
+  appendLog(
+    'REAL_COMMENT_ICON_FOUND',
+    {
+      strategy:
+        found.strategy,
+
+      rect:
+        found.button.rect,
+
+      aria:
+        found.button.aria,
+
+      title:
+        found.button.title,
+
+      text:
+        found.button.text,
+
+      actionBar:
+        found.actionBar ||
+        null
+    }
+  );
+
+  const buttons =
+    page.locator(
+      'button,[role="button"],a'
+    );
+
+  const locator =
+    buttons.nth(
+      found.button.index
+    );
+
+  /*
+   * scroll into view
+   */
+  await locator.scrollIntoViewIfNeeded();
+
+  /*
+   * کلیک واقعی.
+   */
+  await locator.click({
+    force: true,
+    timeout: 5000
+  });
+
+  await page.waitForTimeout(
+    COMMENT_PANEL_WAIT
+  );
+
+  return found;
+}
+
+/* =========================================================
+   COMMENT PANEL VERIFICATION
+   ========================================================= */
+
+async function inspectAfterCommentClick(
+  page
+) {
+  return page.evaluate(() => {
+    const bodyText =
+      document.body?.innerText ||
+      '';
+
+    const dialogs =
+      Array.from(
+        document.querySelectorAll(
+          '[role="dialog"]'
+        )
+      ).filter(
+        element => {
+          const style =
+            getComputedStyle(
+              element
+            );
+
+          const rect =
+            element.getBoundingClientRect();
+
+          return (
+            style.display !==
+              'none' &&
+            style.visibility !==
+              'hidden' &&
+            rect.width > 200 &&
+            rect.height > 200
+          );
+        }
+      );
+
+    const textareas =
+      Array.from(
+        document.querySelectorAll(
+          'textarea'
+        )
+      ).filter(
+        element =>
+          element.getBoundingClientRect()
+            .width > 0
+      );
+
+    const editables =
+      Array.from(
+        document.querySelectorAll(
+          '[contenteditable="true"]'
+        )
+      ).filter(
+        element =>
+          element.getBoundingClientRect()
+            .width > 0
+      );
+
+    const commentSignals = [
+      'View all comments',
+      'View all',
+      'Add a comment',
+      'Reply',
+      'پاسخ',
+      'نظر',
+      'دیدگاه'
+    ];
+
+    const bodySignals =
+      commentSignals.filter(
+        signal =>
+          bodyText
+            .toLocaleLowerCase()
+            .includes(
+              signal
+                .toLocaleLowerCase()
+            )
+      );
+
+    return {
+      dialogCount:
+        dialogs.length,
+
+      textareaCount:
+        textareas.length,
+
+      editableCount:
+        editables.length,
+
+      bodySignals,
+
+      bodyLength:
+        bodyText.length
+    };
+  });
+}
+
+async function verifyCommentPanel(
+  page
+) {
+  const initial =
+    await inspectAfterCommentClick(
+      page
+    );
+
+  /*
+   * Dialog is strongest signal.
+   */
+  if (
+    initial.dialogCount >
+    0
+  ) {
+    return {
+      verified: true,
+      reason:
+        'dialog'
+    };
+  }
+
+  /*
+   * اگر dialog نبود، ولی
+   * comment-specific input ایجاد شده.
+   */
+  if (
+    initial.textareaCount >
+      0 &&
+    initial.bodySignals.length >
+      0
+  ) {
+    return {
+      verified: true,
+      reason:
+        'comment-input-and-signal'
+    };
+  }
+
+  /*
+   * چند بار کوتاه صبر می‌کنیم
+   * برای رندر asynchronous.
+   */
+  for (
+    let i = 0;
+    i < 5;
+    i++
+  ) {
+    await page.waitForTimeout(
+      500
+    );
+
+    const state =
+      await inspectAfterCommentClick(
+        page
+      );
+
+    if (
+      state.dialogCount >
+        0 ||
+      (
+        state.textareaCount >
+          0 &&
+        state.bodySignals.length >
+          0
+      )
+    ) {
+      return {
+        verified: true,
+        reason:
+          state.dialogCount
+            ? 'dialog-delayed'
+            : 'comment-ui-delayed'
+      };
+    }
+  }
+
+  return {
+    verified: false,
+    reason:
+      'COMMENT_PANEL_NOT_VERIFIED'
+  };
+}
+
+/* =========================================================
+   COMMENT EXTRACTION
+   ========================================================= */
+
+async function findCommentContainer(
+  page
+) {
+  return page.evaluate(() => {
+    const dialogs =
+      Array.from(
+        document.querySelectorAll(
+          '[role="dialog"]'
+        )
+      ).filter(
+        element => {
+          const rect =
+            element.getBoundingClientRect();
+
+          const style =
+            getComputedStyle(
+              element
+            );
+
+          return (
+            rect.width > 250 &&
+            rect.height > 250 &&
+            style.display !==
+              'none'
+          );
+        }
+      );
+
+    if (
+      dialogs.length
+    ) {
+      dialogs.sort(
+        (a, b) =>
+          b.getBoundingClientRect()
+            .height -
+          a.getBoundingClientRect()
+            .height
+      );
+
+      return {
+        type:
+          'dialog',
+        found:
+          true
+      };
+    }
+
+    /*
+     * Fallback overlay:
+     * فقط وقتی بعد از click ساخته شده
+     * و right side/center است.
+     */
+    const candidates =
+      Array.from(
+        document.querySelectorAll(
+          'body *'
+        )
+      )
+        .map(
+          element => ({
+            element,
+            rect:
+              element.getBoundingClientRect(),
+            style:
               getComputedStyle(
                 element
-              );
-
-            const rect =
-              element.getBoundingClientRect();
-
-            if (
-              rect.width < 260 ||
-              rect.width > 550
-            ) {
-              return false;
-            }
-
-            if (
-              rect.height < 220
-            ) {
-              return false;
-            }
-
-            if (
-              rect.x <
-              viewportWidth * 0.50
-            ) {
-              return false;
-            }
-
-            if (
-              !/(auto|scroll)/.test(
-                style.overflowY
-              )
-            ) {
-              return false;
-            }
-
-            return (
-              element.scrollHeight >
-              element.clientHeight + 50
-            );
-          }
-        );
-
-      candidates.sort(
-        (a, b) => {
-          const score = element => {
-            const rect =
-              element.getBoundingClientRect();
-
-            const text =
+              ),
+            text:
               element.innerText ||
-              '';
+              ''
+          })
+        )
+        .filter(
+          item =>
+            item.rect.width >
+              250 &&
+            item.rect.height >
+              250 &&
+            item.rect.right >
+              window.innerWidth *
+                0.35 &&
+            /(auto|scroll)/.test(
+              item.style.overflowY
+            ) &&
+            item.element
+              .scrollHeight >
+              item.element
+                .clientHeight +
+                50
+        )
+      .sort(
+        (a, b) => {
+          const score =
+            item => {
+              let s = 0;
 
-            let value = 0;
+              if (
+                /Add a comment/i.test(
+                  item.text
+                )
+              ) {
+                s += 20;
+              }
 
-            if (
-              /Add a comment/i.test(
-                text
-              )
-            ) {
-              value += 20;
-            }
+              if (
+                /Reply/i.test(
+                  item.text
+                )
+              ) {
+                s += 10;
+              }
 
-            if (
-              /View insights/i.test(
-                text
-              )
-            ) {
-              value += 10;
-            }
+              if (
+                item.rect.right >
+                window.innerWidth *
+                  0.7
+              ) {
+                s += 5;
+              }
 
-            if (
-              rect.x >
-              viewportWidth * 0.58
-            ) {
-              value += 5;
-            }
-
-            return value;
-          };
+              return s;
+            };
 
           return (
             score(b) -
@@ -742,201 +1409,27 @@ async function scrollWebCommentPanel(
         }
       );
 
-      const panel =
-        candidates[0];
-
-      if (!panel) {
-        return null;
-      }
-
-      const before =
-        panel.scrollTop;
-
-      const max =
-        Math.max(
-          0,
-          panel.scrollHeight -
-            panel.clientHeight
-        );
-
-      panel.scrollTop =
-        Math.min(
-          max,
-          before + pixels
-        );
-
-      return {
-        before,
-        after:
-          panel.scrollTop,
-        max,
-        changed:
-          panel.scrollTop !== before
-      };
-    },
-    amount
-  );
-}
-
-/**
- * یک بار screenshot:
- *
- * قبل از آن کمی وارد لیست کامنت‌ها می‌شویم
- * تا خود لیست دیده شود، نه فقط کپشن.
- */
-async function saveCommentsScreenshot(
-  page
-) {
-  await scrollWebCommentPanel(
-    page,
-    450
-  );
-
-  await page.waitForTimeout(
-    700
-  );
-
-  const panel =
-    await findWebCommentPanel(
-      page
-    );
-
-  const file =
-    path.join(
-      ARTIFACTS,
-      'comments-list.png'
-    );
-
-  if (
-    panel &&
-    panel.rect
-  ) {
-    const viewport =
-      await page
-        .viewportSize();
-
-    const x =
-      Math.max(
-        0,
-        Math.floor(
-          panel.rect.x
-        )
-      );
-
-    const y =
-      Math.max(
-        0,
-        Math.floor(
-          panel.rect.y
-        )
-      );
-
-    const width =
-      Math.min(
-        Math.floor(
-          panel.rect.width
-        ),
-        viewport.width - x
-      );
-
-    const height =
-      Math.min(
-        Math.floor(
-          panel.rect.height
-        ),
-        viewport.height - y
-      );
-
-    if (
-      width > 10 &&
-      height > 10
-    ) {
-      await page.screenshot({
-        path: file,
-        clip: {
-          x,
-          y,
-          width,
-          height
-        }
-      });
-
-      return file;
-    }
-  }
-
-  await page.screenshot({
-    path: file,
-    fullPage: false
+    return {
+      type:
+        'scrollable-overlay',
+      found:
+        candidates.length >
+        0
+    };
   });
-
-  return file;
 }
 
-/**
- * متن‌های UI که نباید به‌عنوان comment گرفته شوند.
- */
-function isUiLine(
-  line
-) {
-  const n =
-    normalizeText(
-      line
-    );
-
-  if (!n) return true;
-
-  if (
-    /^(follow|following|reply|replies|like|likes|more|translated|view all replies)$/i.test(
-      n
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /^(دنبال کردن|دنبال شده|پاسخ|پاسخ ها|پسندیدن|بیشتر|ترجمه|نمایش همه پاسخ ها)$/i.test(
-      n
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /^(\d+([smhdw]|\s*(ثانیه|دقیقه|ساعت|روز|هفته|ماه|سال)))$/i.test(
-      n
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    /^\d+([,.]\d+)*$/.test(
-      n
-    )
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * این تابع فقط داخل پنل سمت راست دنبال
- * profile link + comment row می‌گردد.
- */
 async function extractVisibleComments(
   page
 ) {
   return page.evaluate(() => {
-    const viewportWidth =
-      window.innerWidth;
-
     const normalize =
       value =>
         String(value || '')
           .normalize('NFKC')
-          .toLocaleLowerCase('fa')
+          .toLocaleLowerCase(
+            'fa'
+          )
           .replace(
             /[\u200b\u200c\u200d\ufeff]/g,
             ''
@@ -975,130 +1468,121 @@ async function extractVisibleComments(
           )
           .trim();
 
-    const isSimpleProfile =
-      href => {
-        return (
-          /^\/[^/]+\/?$/.test(
-            href
-          ) &&
-          !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
-            href
-          )
+    const isProfileHref =
+      href =>
+        /^\/[^/]+\/?$/.test(
+          href || ''
+        ) &&
+        !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
+          href || ''
         );
-      };
 
-    const all =
-      Array.from(
-        document.querySelectorAll(
-          'body *'
+    /*
+     * تعیین container.
+     */
+    let root =
+      document.querySelector(
+        '[role="dialog"]'
+      );
+
+    if (!root) {
+      const candidates =
+        Array.from(
+          document.querySelectorAll(
+            'body *'
+          )
         )
-      );
+          .map(
+            element => {
+              const rect =
+                element.getBoundingClientRect();
 
-    const panels =
-      all.filter(
-        element => {
-          const style =
-            getComputedStyle(
-              element
-            );
+              const style =
+                getComputedStyle(
+                  element
+                );
 
-          const rect =
-            element.getBoundingClientRect();
+              return {
+                element,
+                rect,
+                style,
+                text:
+                  element.innerText ||
+                  ''
+              };
+            }
+          )
+          .filter(
+            item =>
+              item.rect.width >
+                250 &&
+              item.rect.height >
+                250 &&
+              /(auto|scroll)/.test(
+                item.style.overflowY
+              ) &&
+              item.element
+                .scrollHeight >
+                item.element
+                  .clientHeight +
+                  50 &&
+              item.rect.right >
+                window.innerWidth *
+                  0.35
+          )
+          .sort(
+            (a, b) => {
+              const score =
+                item => {
+                  let s = 0;
 
-          if (
-            rect.width < 260 ||
-            rect.width > 550
-          ) {
-            return false;
-          }
+                  if (
+                    /Reply/i.test(
+                      item.text
+                    )
+                  ) {
+                    s += 15;
+                  }
 
-          if (
-            rect.height < 220
-          ) {
-            return false;
-          }
+                  if (
+                    /Add a comment/i.test(
+                      item.text
+                    )
+                  ) {
+                    s += 10;
+                  }
 
-          if (
-            rect.x <
-            viewportWidth * 0.50
-          ) {
-            return false;
-          }
+                  return s;
+                };
 
-          if (
-            !/(auto|scroll)/.test(
-              style.overflowY
-            )
-          ) {
-            return false;
-          }
-
-          return (
-            element.scrollHeight >
-            element.clientHeight + 50
+              return (
+                score(b) -
+                score(a)
+              );
+            }
           );
-        }
-      );
 
-    if (!panels.length) {
+      root =
+        candidates[0]
+          ?.element ||
+        null;
+    }
+
+    if (!root) {
       return [];
     }
 
-    panels.sort(
-      (a, b) => {
-        const score = el => {
-          const rect =
-            el.getBoundingClientRect();
-
-          const text =
-            el.innerText || '';
-
-          let s = 0;
-
-          if (
-            /Add a comment/i.test(
-              text
-            )
-          ) {
-            s += 20;
-          }
-
-          if (
-            /View insights/i.test(
-              text
-            )
-          ) {
-            s += 10;
-          }
-
-          if (
-            rect.x >
-            viewportWidth * 0.58
-          ) {
-            s += 5;
-          }
-
-          return s;
-        };
-
-        return score(b) - score(a);
-      }
-    );
-
-    const panel =
-      panels[0];
-
     const links =
       Array.from(
-        panel.querySelectorAll(
+        root.querySelectorAll(
           'a[href^="/"]'
         )
       ).filter(
         link =>
-          isSimpleProfile(
+          isProfileHref(
             link.getAttribute(
               'href'
-            ) || ''
+            )
           )
       );
 
@@ -1119,9 +1603,7 @@ async function extractVisibleComments(
           ''
         ).trim();
 
-      if (
-        !username
-      ) {
+      if (!username) {
         continue;
       }
 
@@ -1133,18 +1615,18 @@ async function extractVisibleComments(
       let node =
         link;
 
-      let row = null;
+      let row =
+        null;
 
       /*
-       * از لینک username به بالا می‌رویم
-       * تا کوچک‌ترین wrapperی که واقعاً
-       * متعلق به یک comment باشد پیدا شود.
+       * از username به parentها می‌رویم
+       * تا خود comment row را پیدا کنیم.
        */
       for (
         let level = 0;
-        level < 10 &&
+        level < 9 &&
         node &&
-        node !== panel;
+        node !== root;
         level++
       ) {
         node =
@@ -1161,8 +1643,17 @@ async function extractVisibleComments(
           ).trim();
 
         if (
-          !text ||
-          text.length > 700
+          !text
+        ) {
+          continue;
+        }
+
+        /*
+         * Caption یا کل پست را رد کن.
+         */
+        if (
+          text.length >
+          800
         ) {
           continue;
         }
@@ -1181,7 +1672,10 @@ async function extractVisibleComments(
         }
 
         const hasReply =
-          /(^|\n)\s*(reply|پاسخ)\s*($|\n)/i.test(
+          /\bReply\b/i.test(
+            text
+          ) ||
+          /(^|\n)\s*پاسخ\s*($|\n)/i.test(
             text
           );
 
@@ -1190,32 +1684,22 @@ async function extractVisibleComments(
             'time'
           ) !== null;
 
-        /*
-         * پست اصلی ممکن است username و caption
-         * داشته باشد ولی Reply ندارد.
-         *
-         * بنابراین Reply یا time لازم است.
-         */
+        const hasLikeButton =
+          node.querySelector(
+            'button,[role="button"]'
+          ) !== null;
+
         if (
           !hasReply &&
-          !hasTime
+          !hasTime &&
+          !hasLikeButton
         ) {
           continue;
         }
 
-        /*
-         * اگر متن شامل Add a comment یا View insights
-         * باشد این wrapper مربوط به خود پست است.
-         */
-        if (
-          /Add a comment|View insights|Boost post/i.test(
-            text
-          )
-        ) {
-          continue;
-        }
+        row =
+          node;
 
-        row = node;
         break;
       }
 
@@ -1223,30 +1707,27 @@ async function extractVisibleComments(
         continue;
       }
 
-      const rawLines =
+      const lines =
         (
           row.innerText ||
           ''
         )
           .split('\n')
           .map(
-            x => x.trim()
+            x =>
+              x.trim()
           )
-          .filter(
-            Boolean
-          );
+          .filter(Boolean);
 
       const commentLines =
-        rawLines.filter(
+        lines.filter(
           line => {
             const n =
               normalize(
                 line
               );
 
-            if (
-              !n
-            ) {
+            if (!n) {
               return false;
             }
 
@@ -1289,14 +1770,6 @@ async function extractVisibleComments(
               return false;
             }
 
-            if (
-              /^(\d+)\s*(s|m|h|d|w|mo|y)$/i.test(
-                n
-              )
-            ) {
-              return false;
-            }
-
             return true;
           }
         );
@@ -1312,31 +1785,27 @@ async function extractVisibleComments(
           '\n'
         ).trim();
 
-      const normalizedComment =
-        normalize(
-          commentText
-        );
-
       if (
-        !normalizedComment
+        !commentText
       ) {
         continue;
       }
 
       /*
-       * کل wrapper مربوط به پست را فیلتر می‌کنیم.
+       * اگر wrapper شامل کپشن و اطلاعات پست است،
+       * آن را comment حساب نکن.
        */
       if (
-        /200|بازدید|View insights|Boost post|Add a comment/i.test(
-          commentText
-        ) &&
-        commentText.length > 250
+        commentText.length >
+        500
       ) {
         continue;
       }
 
       const key =
-        `${profilePath}|${normalizedComment}`;
+        `${profilePath}|${normalize(
+          commentText
+        )}`;
 
       if (
         seen.has(key)
@@ -1347,113 +1816,182 @@ async function extractVisibleComments(
       seen.add(key);
 
       results.push({
+        key,
         username,
         profilePath,
         commentText,
-        normalizedComment,
-        rowText:
-          textSafe(row)
+        normalizedComment:
+          normalize(
+            commentText
+          )
       });
     }
 
     return results;
-
-    function textSafe(node) {
-      return (
-        node?.innerText ||
-        ''
-      )
-        .trim()
-        .slice(0, 1000);
-    }
   });
 }
 
-/**
- * "View more comments" در همان پنل.
- */
+/* =========================================================
+   COMMENTS SCROLLING
+   ========================================================= */
+
+async function scrollCommentContainer(
+  page,
+  amount
+) {
+  return page.evaluate(
+    pixels => {
+      let root =
+        document.querySelector(
+          '[role="dialog"]'
+        );
+
+      if (!root) {
+        const candidates =
+          Array.from(
+            document.querySelectorAll(
+              'body *'
+            )
+          )
+            .map(
+              element => {
+                const rect =
+                  element.getBoundingClientRect();
+
+                const style =
+                  getComputedStyle(
+                    element
+                  );
+
+                return {
+                  element,
+                  rect,
+                  style,
+                  text:
+                    element.innerText ||
+                    ''
+                };
+              }
+            )
+            .filter(
+              item =>
+                item.rect.width >
+                  250 &&
+                item.rect.height >
+                  250 &&
+                item.rect.right >
+                  window.innerWidth *
+                    0.35 &&
+                /(auto|scroll)/.test(
+                  item.style.overflowY
+                ) &&
+                item.element
+                  .scrollHeight >
+                  item.element
+                    .clientHeight +
+                    50
+            )
+            .sort(
+              (a, b) => {
+                const score =
+                  item => {
+                    let s = 0;
+
+                    if (
+                      /Reply/i.test(
+                        item.text
+                      )
+                    ) {
+                      s += 15;
+                    }
+
+                    if (
+                      /Add a comment/i.test(
+                        item.text
+                      )
+                    ) {
+                      s += 10;
+                    }
+
+                    return s;
+                  };
+
+                return (
+                  score(b) -
+                  score(a)
+                );
+              }
+            );
+
+        root =
+          candidates[0]
+            ?.element ||
+          null;
+      }
+
+      if (!root) {
+        return {
+          changed: false,
+          before: null,
+          after: null
+        };
+      }
+
+      const before =
+        root.scrollTop;
+
+      const max =
+        Math.max(
+          0,
+          root.scrollHeight -
+            root.clientHeight
+        );
+
+      root.scrollTop =
+        Math.min(
+          max,
+          before + pixels
+        );
+
+      return {
+        changed:
+          root.scrollTop !==
+          before,
+
+        before,
+
+        after:
+          root.scrollTop,
+
+        max,
+
+        clientHeight:
+          root.clientHeight,
+
+        scrollHeight:
+          root.scrollHeight
+      };
+    },
+    amount
+  );
+}
+
 async function clickMoreComments(
   page
 ) {
   return page.evaluate(() => {
-    const viewportWidth =
-      window.innerWidth;
-
-    const all =
-      Array.from(
-        document.querySelectorAll(
-          'body *'
-        )
+    let root =
+      document.querySelector(
+        '[role="dialog"]'
       );
 
-    const panels =
-      all.filter(
-        element => {
-          const style =
-            getComputedStyle(
-              element
-            );
-
-          const rect =
-            element.getBoundingClientRect();
-
-          return (
-            rect.width >= 260 &&
-            rect.width <= 550 &&
-            rect.height >= 220 &&
-            rect.x >
-              viewportWidth * 0.50 &&
-            /(auto|scroll)/.test(
-              style.overflowY
-            ) &&
-            element.scrollHeight >
-              element.clientHeight + 50
-          );
-        }
-      );
-
-    if (!panels.length) {
+    if (!root) {
       return false;
     }
 
-    panels.sort(
-      (a, b) => {
-        const score =
-          element => {
-            const text =
-              element.innerText || '';
-
-            let s = 0;
-
-            if (
-              /Add a comment/i.test(
-                text
-              )
-            ) {
-              s += 20;
-            }
-
-            if (
-              /View insights/i.test(
-                text
-              )
-            ) {
-              s += 10;
-            }
-
-            return s;
-          };
-
-        return score(b) - score(a);
-      }
-    );
-
-    const panel =
-      panels[0];
-
     const candidates =
       Array.from(
-        panel.querySelectorAll(
+        root.querySelectorAll(
           'button,[role="button"],a,span,div'
         )
       );
@@ -1469,7 +2007,7 @@ async function clickMoreComments(
         ).trim();
 
       if (
-        /^(View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر)$/i.test(
+        /^(View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات)$/i.test(
           text
         )
       ) {
@@ -1483,339 +2021,194 @@ async function clickMoreComments(
   });
 }
 
-/**
- * Reply را با username + commentText پیدا می‌کنیم.
- */
+/* =========================================================
+   COMMENT REPLY
+   ========================================================= */
+
 async function clickReplyForComment(
   page,
   comment
 ) {
-  return page.evaluate(
-    target => {
-      const viewportWidth =
-        window.innerWidth;
-
-      const normalize =
-        value =>
-          String(value || '')
-            .normalize('NFKC')
-            .toLocaleLowerCase('fa')
-            .replace(
-              /[\u200b\u200c\u200d\ufeff]/g,
-              ''
-            )
-            .replace(
-              /[ًٌٍَُِّْـ]/g,
-              ''
-            )
-            .replace(
-              /ي/g,
-              'ی'
-            )
-            .replace(
-              /ى/g,
-              'ی'
-            )
-            .replace(
-              /ك/g,
-              'ک'
-            )
-            .replace(
-              /[ۀە]/g,
-              'ه'
-            )
-            .replace(
-              /[أإآ]/g,
-              'ا'
-            )
-            .replace(
-              /ؤ/g,
-              'و'
-            )
-            .replace(
-              /\s+/g,
-              ' '
-            )
-            .trim();
-
-      const panels =
-        Array.from(
-          document.querySelectorAll(
-            'body *'
-          )
-        )
-          .filter(
-            element => {
-              const style =
-                getComputedStyle(
-                  element
-                );
-
-              const rect =
-                element.getBoundingClientRect();
-
-              return (
-                rect.width >= 260 &&
-                rect.width <= 550 &&
-                rect.height >= 220 &&
-                rect.x >
-                  viewportWidth * 0.50 &&
-                /(auto|scroll)/.test(
-                  style.overflowY
-                ) &&
-                element.scrollHeight >
-                  element.clientHeight + 50
-              );
-            }
+  const result =
+    await page.evaluate(
+      target => {
+        const root =
+          document.querySelector(
+            '[role="dialog"]'
           );
 
-      if (!panels.length) {
-        return {
-          clicked: false,
-          reason:
-            'comment-panel-not-found'
-        };
-      }
-
-      panels.sort(
-        (a, b) => {
-          const score =
-            element => {
-              const text =
-                element.innerText ||
-                '';
-
-              let s = 0;
-
-              if (
-                /Add a comment/i.test(
-                  text
-                )
-              ) {
-                s += 20;
-              }
-
-              if (
-                /View insights/i.test(
-                  text
-                )
-              ) {
-                s += 10;
-              }
-
-              return s;
-            };
-
-          return score(b) - score(a);
-        }
-      );
-
-      const panel =
-        panels[0];
-
-      const links =
-        Array.from(
-          panel.querySelectorAll(
-            'a[href^="/"]'
-          )
-        );
-
-      for (
-        const link of links
-      ) {
-        const href =
-          link.getAttribute(
-            'href'
-          ) || '';
-
-        if (
-          href !==
-          target.profilePath
-        ) {
-          continue;
+        if (!root) {
+          return {
+            clicked: false,
+            reason:
+              'comment-dialog-not-found'
+          };
         }
 
-        const linkText =
-          normalize(
-            link.textContent ||
-              ''
+        const normalize =
+          value =>
+            String(value || '')
+              .normalize(
+                'NFKC'
+              )
+              .toLocaleLowerCase(
+                'fa'
+              )
+              .replace(
+                /[\u200b\u200c\u200d\ufeff]/g,
+                ''
+              )
+              .replace(
+                /[ًٌٍَُِّْـ]/g,
+                ''
+              )
+              .replace(
+                /ي/g,
+                'ی'
+              )
+              .replace(
+                /ك/g,
+                'ک'
+              )
+              .replace(
+                /[ۀە]/g,
+                'ه'
+              )
+              .replace(
+                /[أإآ]/g,
+                'ا'
+              )
+              .replace(
+                /\s+/g,
+                ' '
+              )
+              .trim();
+
+        const links =
+          Array.from(
+            root.querySelectorAll(
+              'a[href^="/"]'
+            )
           );
-
-        if (
-          linkText !==
-          normalize(
-            target.username
-          )
-        ) {
-          continue;
-        }
-
-        let node =
-          link;
 
         for (
-          let level = 0;
-          level < 10 &&
-          node &&
-          node !== panel;
-          level++
+          const link of links
         ) {
-          node =
-            node.parentElement;
+          const href =
+            link.getAttribute(
+              'href'
+            ) || '';
 
-          if (!node) {
-            break;
+          if (
+            href !==
+            target.profilePath
+          ) {
+            continue;
           }
 
-          const text =
+          const username =
             normalize(
-              node.innerText ||
+              link.textContent ||
                 ''
             );
 
           if (
-            !text.includes(
-              normalize(
-                target.commentText
-              )
+            username !==
+            normalize(
+              target.username
             )
           ) {
             continue;
           }
 
-          if (
-            !text.includes(
-              normalize(
-                target.username
-              )
-            )
-          ) {
-            continue;
-          }
-
-          const elements =
-            Array.from(
-              node.querySelectorAll(
-                'button,[role="button"],span,div'
-              )
-            );
+          let node =
+            link;
 
           for (
-            const el of elements
+            let level = 0;
+            level < 9 &&
+            node &&
+            node !== root;
+            level++
           ) {
-            const label =
-              normalize(
-                (
-                  el.innerText ||
-                  ''
-                ).trim()
-              );
+            node =
+              node.parentElement;
 
-            const aria =
+            if (!node) {
+              break;
+            }
+
+            const text =
               normalize(
-                el.getAttribute(
-                  'aria-label'
-                ) || ''
+                node.innerText ||
+                  ''
               );
 
             if (
-              label ===
-                'reply' ||
-              label ===
-                'پاسخ' ||
-              aria.includes(
-                'reply'
-              ) ||
-              aria.includes(
-                'پاسخ'
+              !text.includes(
+                normalize(
+                  target.commentText
+                )
               )
             ) {
-              el.click();
+              continue;
+            }
 
-              return {
-                clicked: true,
-                rowText:
+            const controls =
+              Array.from(
+                node.querySelectorAll(
+                  'button,[role="button"],span,div'
+                )
+              );
+
+            for (
+              const control of
+              controls
+            ) {
+              const label =
+                normalize(
                   (
-                    node.innerText ||
+                    control.innerText ||
                     ''
-                  )
-                    .trim()
-                    .slice(
-                      0,
-                      800
-                    )
-              };
+                  ).trim()
+                );
+
+              const aria =
+                normalize(
+                  control.getAttribute(
+                    'aria-label'
+                  ) ||
+                    ''
+                );
+
+              if (
+                label ===
+                  'reply' ||
+                label ===
+                  'پاسخ' ||
+                aria.includes(
+                  'reply'
+                ) ||
+                aria.includes(
+                  'پاسخ'
+                )
+              ) {
+                control.click();
+
+                return {
+                  clicked: true
+                };
+              }
             }
           }
-
-          /*
-           * ممکن است Reply داخل text باشد
-           * ولی button نباشد.
-           */
-          const replyText =
-            Array.from(
-              node.querySelectorAll(
-                '*'
-              )
-            ).find(
-              el => {
-                const t =
-                  (
-                    el.textContent ||
-                    ''
-                  ).trim();
-
-                return (
-                  /^Reply$/i.test(
-                    t
-                  ) ||
-                  /^پاسخ$/i.test(
-                    t
-                  )
-                );
-              }
-            );
-
-          if (
-            replyText
-          ) {
-            replyText.click();
-
-            return {
-              clicked: true,
-              rowText:
-                (
-                  node.innerText ||
-                  ''
-                )
-                  .trim()
-                  .slice(
-                    0,
-                    800
-                  )
-            };
-          }
         }
-      }
 
-      return {
-        clicked: false,
-        reason:
-          'reply-control-not-found'
-      };
-    },
-    comment
-  );
-}
-
-async function sendReply(
-  page,
-  comment,
-  replyText
-) {
-  const result =
-    await clickReplyForComment(
-      page,
+        return {
+          clicked: false,
+          reason:
+            'reply-button-not-found'
+        };
+      },
       comment
     );
 
@@ -1823,15 +2216,26 @@ async function sendReply(
     !result.clicked
   ) {
     throw new Error(
-      `Reply control not found: ${result.reason}`
+      `Reply click failed: ${result.reason}`
     );
   }
+}
+
+async function sendReply(
+  page,
+  comment,
+  replyText
+) {
+  await clickReplyForComment(
+    page,
+    comment
+  );
 
   await page.waitForTimeout(
     500
   );
 
-  const inputs = [
+  const candidates = [
     page
       .getByPlaceholder(
         /Reply|Add a comment|پاسخ|نظر/i
@@ -1855,7 +2259,7 @@ async function sendReply(
 
   for (
     const candidate of
-    inputs
+    candidates
   ) {
     if (
       await candidate
@@ -1881,20 +2285,19 @@ async function sendReply(
     replyText
   );
 
-  let sent =
-    await clickText(
-      page,
-      [
-        'Post',
-        'Reply',
-        'Send',
-        'ارسال',
-        'پاسخ'
-      ],
+  let submitted =
+    await safeClick(
+      page.getByRole(
+        'button',
+        {
+          name:
+            /Post|Reply|Send|ارسال|پاسخ/i
+        }
+      ),
       3000
     );
 
-  if (!sent) {
+  if (!submitted) {
     await input.press(
       'Enter'
     );
@@ -1904,19 +2307,17 @@ async function sendReply(
     1000
   );
 
-  const value =
+  const remaining =
     await input
       .inputValue()
       .catch(
         () => ''
       );
 
-  /*
-   * اگر input خالی نشده،
-   * یک بار دیگر Enter می‌زنیم.
-   */
   if (
-    String(value || '').trim()
+    String(
+      remaining || ''
+    ).trim()
   ) {
     await input.press(
       'Enter'
@@ -1935,13 +2336,19 @@ async function sendReply(
       );
 
   if (
-    String(finalValue || '').trim()
+    String(
+      finalValue || ''
+    ).trim()
   ) {
     throw new Error(
-      'Reply was not confirmed: input still contains text.'
+      'Reply submission could not be confirmed.'
     );
   }
 }
+
+/* =========================================================
+   DM
+   ========================================================= */
 
 async function sendDM(
   dmPage,
@@ -1978,13 +2385,16 @@ async function sendDM(
   );
 
   let opened =
-    await clickText(
-      dmPage,
-      [
-        /Message/i,
-        /Send message/i,
-        /پیام/i
-      ],
+    await safeClick(
+      dmPage
+        .getByRole(
+          'button',
+          {
+            name:
+              /Message|Send message|پیام/i
+          }
+        )
+        .first(),
       3500
     );
 
@@ -2005,22 +2415,21 @@ async function sendDM(
     ) {
       await safeClick(
         more,
-        2000
+        2200
       );
 
       await dmPage.waitForTimeout(
-        400
+        500
       );
     }
 
     opened =
-      await clickText(
-        dmPage,
-        [
-          /Message/i,
-          /Send message/i,
-          /پیام/i
-        ],
+      await safeClick(
+        dmPage
+          .getByText(
+            /Message|Send message|پیام/i
+          )
+          .first(),
         3000
       );
   }
@@ -2031,7 +2440,11 @@ async function sendDM(
     );
   }
 
-  const inputs = [
+  await dmPage.waitForTimeout(
+    700
+  );
+
+  const candidates = [
     dmPage
       .getByPlaceholder(
         /Message/i
@@ -2061,7 +2474,7 @@ async function sendDM(
 
   for (
     const candidate of
-    inputs
+    candidates
   ) {
     if (
       await candidate
@@ -2087,27 +2500,29 @@ async function sendDM(
     message
   );
 
-  const sent =
-    await clickText(
-      dmPage,
-      [
-        'Send',
-        'ارسال'
-      ],
-      3000
+  const submitted =
+    await safeClick(
+      dmPage.getByRole(
+        'button',
+        {
+          name:
+            /Send|ارسال/i
+        }
+      ),
+      2500
     );
 
-  if (!sent) {
+  if (!submitted) {
     await input.press(
       'Enter'
     );
   }
 
   await dmPage.waitForTimeout(
-    1000
+    900
   );
 
-  const value =
+  const remaining =
     await input
       .inputValue()
       .catch(
@@ -2115,14 +2530,16 @@ async function sendDM(
       );
 
   if (
-    String(value || '').trim()
+    String(
+      remaining || ''
+    ).trim()
   ) {
     await input.press(
       'Enter'
     );
 
     await dmPage.waitForTimeout(
-      900
+      800
     );
   }
 
@@ -2134,145 +2551,79 @@ async function sendDM(
       );
 
   if (
-    String(finalValue || '').trim()
+    String(
+      finalValue || ''
+    ).trim()
   ) {
     throw new Error(
-      `DM was not confirmed for ${username}: input still contains text.`
+      `DM submission could not be confirmed for ${username}.`
     );
   }
 }
 
-async function processMatch(
-  page,
-  dmPage,
-  comment,
-  keywordResult,
-  commentReply,
-  dmReply
+/* =========================================================
+   ONE SCREENSHOT
+   ========================================================= */
+
+async function saveCommentsScreenshot(
+  page
 ) {
-  const result = {
-    username:
-      comment.username,
-
-    profilePath:
-      comment.profilePath,
-
-    comment:
-      comment.commentText,
-
-    keyword:
-      keywordResult.keyword,
-
-    matchMode:
-      keywordResult.mode,
-
-    matchDistance:
-      keywordResult.distance || 0,
-
-    reply:
-      'pending',
-
-    dm:
-      'pending',
-
-    status:
-      'pending'
-  };
-
-  appendLog(
-    'MATCH_FOUND',
-    {
-      username:
-        comment.username,
-
-      profile:
-        comment.profilePath,
-
-      keyword:
-        keywordResult.keyword,
-
-      mode:
-        keywordResult.mode,
-
-      comment:
-        comment.commentText
-    }
-  );
-
-  try {
-    /*
-     * Reply در صفحه اصلی
-     */
-    await sendReply(
-      page,
-      comment,
-      commentReply
+  const file =
+    path.join(
+      ARTIFACTS,
+      'comments-list.png'
     );
 
-    result.reply =
-      'sent';
+  const dialog =
+    await page
+      .locator(
+        '[role="dialog"]'
+      )
+      .last();
 
-    appendLog(
-      'REPLY_SENT',
-      {
-        username:
-          comment.username,
+  if (
+    await dialog
+      .isVisible()
+      .catch(
+        () => false
+      )
+  ) {
+    await dialog.screenshot({
+      path: file
+    });
 
-        comment:
-          comment.commentText
-      }
-    );
-
-    /*
-     * DM در Page دوم
-     */
-    await sendDM(
-      dmPage,
-      comment.profilePath,
-      comment.username,
-      dmReply
-    );
-
-    result.dm =
-      'sent';
-
-    result.status =
-      'done';
-
-    appendLog(
-      'DM_SENT',
-      {
-        username:
-          comment.username
-      }
-    );
-  } catch (error) {
-    result.status =
-      'error';
-
-    result.error =
-      String(
-        error?.message ||
-          error
-      );
-
-    appendLog(
-      'MATCH_FAILED',
-      {
-        username:
-          comment.username,
-
-        comment:
-          comment.commentText,
-
-        error:
-          result.error
-      }
-    );
+    return file;
   }
 
-  return result;
+  const viewport =
+    await page.viewportSize();
+
+  const controls =
+    await inspectActionButtons(
+      page
+    );
+
+  /*
+   * fallback screen screenshot،
+   * ولی فقط بعد از verified comment UI.
+   */
+  if (
+    viewport
+  ) {
+    await page.screenshot({
+      path: file,
+      fullPage: false
+    });
+
+    return file;
+  }
+
+  return null;
 }
+
+/* =========================================================
+   PROCESS POST
+   ========================================================= */
 
 async function processPost(
   page,
@@ -2292,9 +2643,6 @@ async function processPost(
     screenshot:
       null,
 
-    rounds:
-      0,
-
     commentsScanned:
       0,
 
@@ -2307,8 +2655,14 @@ async function processPost(
     matchesFailed:
       0,
 
-    matches:
-      []
+    matchItems:
+      [],
+
+    rounds:
+      0,
+
+    commentClickStrategy:
+      null
   };
 
   appendLog(
@@ -2328,7 +2682,7 @@ async function processPost(
   );
 
   await page.waitForTimeout(
-    1800
+    1500
   );
 
   await dismissCommonPopups(
@@ -2336,73 +2690,72 @@ async function processPost(
   );
 
   /*
-   * اول تلاش می‌کنیم پنل inline وب را پیدا کنیم.
+   * =======================================================
+   * STEP 1:
+   * REAL ACTION BAR COMMENT ICON
+   * =======================================================
    */
-  let panel =
-    await findWebCommentPanel(
-      page
-    );
+  let commentButton;
 
-  /*
-   * اگر هنوز نبود،
-   * یک بار روی comment control می‌زنیم.
-   */
-  if (!panel) {
-    appendLog(
-      'COMMENT_PANEL_NOT_FOUND_INITIAL'
-    );
-
-    const clicked =
-      await clickText(
-        page,
-        [
-          /comment/i,
-          /comments/i,
-          /نظر/i,
-          /دیدگاه/i
-        ],
-        3000
+  try {
+    commentButton =
+      await clickRealCommentIcon(
+        page
       );
-
+  } catch (error) {
     appendLog(
-      'COMMENT_CONTROL_CLICK_RESULT',
+      'REAL_COMMENT_CLICK_FAILED',
       {
-        clicked
+        error:
+          String(
+            error?.message ||
+              error
+          )
       }
     );
 
-    await page.waitForTimeout(
-      1200
-    );
+    throw error;
   }
 
-  panel =
-    await findWebCommentPanel(
+  postLog.commentClickStrategy =
+    commentButton.strategy;
+
+  /*
+   * =======================================================
+   * STEP 2:
+   * VERIFY COMMENT UI
+   * =======================================================
+   */
+  const verification =
+    await verifyCommentPanel(
       page
     );
 
-  if (!panel) {
-    throw new Error(
-      'Instagram Web comment panel could not be located.'
-    );
-  }
-
   appendLog(
-    'COMMENT_PANEL_FOUND',
+    'COMMENT_UI_VERIFICATION',
     {
-      rect:
-        panel.rect,
+      verified:
+        verification.verified,
 
-      scrollHeight:
-        panel.scrollHeight,
-
-      clientHeight:
-        panel.clientHeight
+      reason:
+        verification.reason
     }
   );
 
+  if (
+    !verification.verified
+  ) {
+    throw new Error(
+      'REAL_COMMENT_BUTTON_CLICKED_BUT_COMMENT_UI_DID_NOT_OPEN'
+    );
+  }
+
   /*
-   * فقط یک Screenshot.
+   * =======================================================
+   * STEP 3:
+   * NOW AND ONLY NOW:
+   * ONE SCREENSHOT
+   * =======================================================
    */
   postLog.screenshot =
     await saveCommentsScreenshot(
@@ -2418,91 +2771,43 @@ async function processPost(
   );
 
   /*
-   * برگرد به ابتدای پنل برای شروع scan.
+   * Ensure comment container exists.
    */
-  await page.evaluate(() => {
-    const viewportWidth =
-      window.innerWidth;
-
-    const all =
-      Array.from(
-        document.querySelectorAll(
-          'body *'
-        )
-      );
-
-    const candidates =
-      all.filter(
-        element => {
-          const style =
-            getComputedStyle(
-              element
-            );
-
-          const rect =
-            element.getBoundingClientRect();
-
-          return (
-            rect.width >= 260 &&
-            rect.width <= 550 &&
-            rect.height >= 220 &&
-            rect.x >
-              viewportWidth * 0.50 &&
-            /(auto|scroll)/.test(
-              style.overflowY
-            ) &&
-            element.scrollHeight >
-              element.clientHeight + 50
-          );
-        }
-      );
-
-    candidates.sort(
-      (a, b) => {
-        const score =
-          element => {
-            const text =
-              element.innerText ||
-              '';
-
-            let s = 0;
-
-            if (
-              /Add a comment/i.test(
-                text
-              )
-            ) {
-              s += 20;
-            }
-
-            if (
-              /View insights/i.test(
-                text
-              )
-            ) {
-              s += 10;
-            }
-
-            return s;
-          };
-
-        return score(b) - score(a);
-      }
+  const container =
+    await findCommentContainer(
+      page
     );
 
-    if (
-      candidates[0]
-    ) {
-      candidates[0].scrollTop =
-        0;
-    }
-  });
+  if (
+    !container?.found
+  ) {
+    throw new Error(
+      'COMMENT_UI_VERIFIED_BUT_COMMENT_CONTAINER_NOT_FOUND'
+    );
+  }
 
-  const processedMatchKeys =
+  appendLog(
+    'COMMENT_CONTAINER_CONFIRMED',
+    {
+      type:
+        container.type
+    }
+  );
+
+  /*
+   * =======================================================
+   * STEP 4:
+   * SCAN
+   * =======================================================
+   */
+  const processed =
     new Set();
 
-  let stableRounds = 0;
-  let lastCommentCount = -1;
+  let stable =
+    0;
+
+  let previousVisible =
+    -1;
 
   for (
     let round = 1;
@@ -2512,27 +2817,21 @@ async function processPost(
     postLog.rounds =
       round;
 
-    /*
-     * در هر دور فقط همین پنل بررسی می‌شود.
-     */
     const comments =
       await extractVisibleComments(
         page
       );
 
-    let newComments =
+    let newMatchCount =
       0;
 
-    let roundMatches =
-      0;
-
+    /*
+     * هر کامنت visible همان لحظه بررسی می‌شود.
+     */
     for (
       const comment of
       comments
     ) {
-      /*
-       * Match قبل از هر چیز.
-       */
       const match =
         keywordMatch(
           comment.commentText,
@@ -2545,78 +2844,169 @@ async function processPost(
         continue;
       }
 
-      const key =
+      const matchKey =
         `${comment.profilePath}|${compactText(
           comment.commentText
         )}|${match.keyword}`;
 
       if (
-        processedMatchKeys.has(
-          key
+        processed.has(
+          matchKey
         )
       ) {
         continue;
       }
 
-      processedMatchKeys.add(
-        key
+      processed.add(
+        matchKey
       );
 
-      roundMatches++;
+      newMatchCount++;
 
       postLog.matchesFound++;
 
+      appendLog(
+        'MATCH_FOUND',
+        {
+          round,
+
+          username:
+            comment.username,
+
+          profile:
+            comment.profilePath,
+
+          keyword:
+            match.keyword,
+
+          mode:
+            match.mode,
+
+          distance:
+            match.distance,
+
+          comment:
+            comment.commentText
+        }
+      );
+
       /*
-       * همین الان پردازش.
+       * Reply + DM بلافاصله.
        */
-      const item =
-        await processMatch(
+      const item = {
+        username:
+          comment.username,
+
+        profile:
+          comment.profilePath,
+
+        comment:
+          comment.commentText,
+
+        keyword:
+          match.keyword,
+
+        mode:
+          match.mode,
+
+        distance:
+          match.distance,
+
+        reply:
+          'pending',
+
+        dm:
+          'pending',
+
+        status:
+          'pending'
+      };
+
+      try {
+        await sendReply(
           page,
-          dmPage,
           comment,
-          match,
-          commentReply,
+          commentReply
+        );
+
+        item.reply =
+          'sent';
+
+        appendLog(
+          'REPLY_SENT',
+          {
+            username:
+              comment.username
+          }
+        );
+
+        /*
+         * DM در page دوم.
+         */
+        await sendDM(
+          dmPage,
+          comment.profilePath,
+          comment.username,
           dmReply
         );
 
-      postLog.matches.push(
+        item.dm =
+          'sent';
+
+        item.status =
+          'done';
+
+        postLog.matchesCompleted++;
+
+        appendLog(
+          'MATCH_COMPLETED',
+          {
+            username:
+              comment.username
+          }
+        );
+      } catch (error) {
+        item.status =
+          'error';
+
+        item.error =
+          String(
+            error?.message ||
+              error
+          );
+
+        postLog.matchesFailed++;
+
+        appendLog(
+          'MATCH_FAILED',
+          {
+            username:
+              comment.username,
+
+            comment:
+              comment.commentText,
+
+            error:
+              item.error
+          }
+        );
+      }
+
+      postLog.matchItems.push(
         item
       );
-
-      if (
-        item.status === 'done'
-      ) {
-        postLog.matchesCompleted++;
-      } else {
-        postLog.matchesFailed++;
-      }
     }
 
-    /*
-     * شمارش commentهای دیده شده.
-     */
-    const currentCount =
+    postLog.commentsScanned =
       comments.length;
 
-    if (
-      currentCount !==
-      lastCommentCount
-    ) {
-      newComments =
-        Math.max(
-          0,
-          currentCount -
-            Math.max(
-              0,
-              lastCommentCount
-            )
-        );
-    }
-
+    /*
+     * Logging کنترل‌شده.
+     */
     if (
       round === 1 ||
-      roundMatches > 0 ||
-      round % 5 === 0
+      round % 5 === 0 ||
+      newMatchCount > 0
     ) {
       appendLog(
         'SCAN_ROUND',
@@ -2626,15 +3016,16 @@ async function processPost(
           visibleComments:
             comments.length,
 
-          roundMatches,
+          newMatches:
+            newMatchCount,
 
           totalMatches:
             postLog.matchesFound,
 
-          matchesCompleted:
+          completed:
             postLog.matchesCompleted,
 
-          matchesFailed:
+          failed:
             postLog.matchesFailed
         }
       );
@@ -2643,53 +3034,61 @@ async function processPost(
     /*
      * Load more.
      */
-    const clickedMore =
-      await clickMoreComments(
-        page
-      );
-
-    await page.waitForTimeout(
-      500
-    );
-
-    const scrollResult =
-      await scrollWebCommentPanel(
-        page,
-        SCROLL_PIXELS
-      );
-
-    await page.waitForTimeout(
-      SCROLL_WAIT_MS
-    );
+    let clickedMore =
+      false;
 
     if (
-      currentCount ===
-        lastCommentCount &&
-      !clickedMore &&
-      !scrollResult?.changed &&
-      roundMatches === 0
+      round === 1 ||
+      round % 2 === 0
     ) {
-      stableRounds++;
-    } else {
-      stableRounds = 0;
+      clickedMore =
+        await clickMoreComments(
+          page
+        );
     }
 
-    lastCommentCount =
-      currentCount;
+    /*
+     * Scroll.
+     */
+    const scroll =
+      await scrollCommentContainer(
+        page,
+        COMMENT_SCROLL_STEP
+      );
+
+    await page.waitForTimeout(
+      COMMENT_SCROLL_WAIT
+    );
 
     /*
-     * توقف فقط بعد چند دور واقعاً ثابت.
+     * Stable detection.
      */
     if (
-      stableRounds >=
-      5
+      comments.length ===
+        previousVisible &&
+      !clickedMore &&
+      !scroll.changed &&
+      newMatchCount === 0
+    ) {
+      stable++;
+    } else {
+      stable = 0;
+    }
+
+    previousVisible =
+      comments.length;
+
+    if (
+      stable >= 6
     ) {
       appendLog(
-        'SCAN_FINISHED_STABLE',
+        'SCAN_STOP_STABLE',
         {
           round,
-          comments:
-            currentCount,
+
+          visibleComments:
+            comments.length,
+
           matches:
             postLog.matchesFound
         }
@@ -2698,77 +3097,6 @@ async function processPost(
       break;
     }
   }
-
-  /*
-   * یک scan نهایی از همین position
-   * تا کامنتی که دقیقاً در همان لحظه visible
-   * است از دست نرود.
-   */
-  const finalComments =
-    await extractVisibleComments(
-      page
-    );
-
-  for (
-    const comment of
-    finalComments
-  ) {
-    const match =
-      keywordMatch(
-        comment.commentText,
-        keywords
-      );
-
-    if (
-      !match.matched
-    ) {
-      continue;
-    }
-
-    const key =
-      `${comment.profilePath}|${compactText(
-        comment.commentText
-      )}|${match.keyword}`;
-
-    if (
-      processedMatchKeys.has(
-        key
-      )
-    ) {
-      continue;
-    }
-
-    processedMatchKeys.add(
-      key
-    );
-
-    postLog.matchesFound++;
-
-    const item =
-      await processMatch(
-        page,
-        dmPage,
-        comment,
-        match,
-        commentReply,
-        dmReply
-      );
-
-    postLog.matches.push(
-      item
-    );
-
-    if (
-      item.status === 'done'
-    ) {
-      postLog.matchesCompleted++;
-    } else {
-      postLog.matchesFailed++;
-    }
-  }
-
-  postLog.commentsScanned =
-    lastCommentCount;
 
   postLog.finishedAt =
     now();
@@ -2798,6 +3126,10 @@ async function processPost(
   return postLog;
 }
 
+/* =========================================================
+   MAIN
+   ========================================================= */
+
 async function main() {
   const postUrls =
     parseList(
@@ -2823,9 +3155,6 @@ async function main() {
       'INSTAGRAM_DM_REPLY'
     );
 
-  /*
-   * پاک کردن log قبلی
-   */
   fs.writeFileSync(
     path.join(
       ARTIFACTS,
@@ -2858,15 +3187,15 @@ async function main() {
     });
 
   /*
-   * Page اصلی:
+   * Main page:
    * Post + comments
    */
   const page =
     await context.newPage();
 
   /*
-   * Page دوم:
-   * DM
+   * Second page:
+   * DM only.
    */
   const dmPage =
     await context.newPage();
@@ -2879,20 +3208,20 @@ async function main() {
     postUrls,
 
     config: {
+      engine:
+        'Instagram Web Desktop - real post Action Bar Comment button',
+
       maxScanRounds:
         MAX_SCAN_ROUNDS,
 
-      scrollPixels:
-        SCROLL_PIXELS,
+      commentScrollStep:
+        COMMENT_SCROLL_STEP,
 
-      scrollWaitMs:
-        SCROLL_WAIT_MS,
+      commentScrollWait:
+        COMMENT_SCROLL_WAIT,
 
-      screenshotCountPerPost:
-        1,
-
-      engine:
-        'Instagram Web Desktop inline right-side comment panel'
+      screenshotsPerPost:
+        1
     },
 
     posts: [],
@@ -2910,7 +3239,7 @@ async function main() {
     );
 
     appendLog(
-      'LOGIN_OK'
+      'LOGIN_SUCCESS'
     );
 
     for (
@@ -2943,6 +3272,7 @@ async function main() {
         runLog.errors.push({
           url:
             postUrls[i],
+
           error:
             message
         });
@@ -2952,6 +3282,7 @@ async function main() {
           {
             url:
               postUrls[i],
+
             error:
               message
           }
@@ -2962,9 +3293,6 @@ async function main() {
     runLog.finishedAt =
       now();
 
-    /*
-     * Summary.
-     */
     writeJson(
       'run-summary.json',
       runLog

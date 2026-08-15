@@ -7,9 +7,34 @@ fs.mkdirSync(ARTIFACTS, { recursive: true });
 
 const env = process.env;
 
+const DEBUG_SCREENSHOT_EVERY_ROUND =
+  env.INSTAGRAM_DEBUG_SCREENSHOT_EVERY_ROUND !== 'false';
+
+const MAX_SCAN_ROUNDS = Number(
+  env.INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS || 80
+);
+
+const SCROLL_PIXELS = Number(
+  env.INSTAGRAM_COMMENT_SCROLL_PIXELS || 900
+);
+
+function now() {
+  return new Date().toISOString();
+}
+
+function safeName(value) {
+  return String(value || '')
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .slice(0, 100);
+}
+
 function required(name) {
   const value = env[name]?.trim();
-  if (!value) throw new Error(`Missing required input: ${name}`);
+
+  if (!value) {
+    throw new Error(`Missing required input: ${name}`);
+  }
+
   return value;
 }
 
@@ -29,11 +54,10 @@ function normalizeText(value) {
     .replace(/ي/g, 'ی')
     .replace(/ى/g, 'ی')
     .replace(/ك/g, 'ک')
-    .replace(/ة/g, 'ه')
     .replace(/[ۀە]/g, 'ه')
     .replace(/[أإآ]/g, 'ا')
-    .replace(/[ؤ]/g, 'و')
-    .replace(/[ة]/g, 'ه')
+    .replace(/ؤ/g, 'و')
+    .replace(/[‏‎‏]/g, '')
     .replace(/[\p{P}\p{S}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -48,7 +72,7 @@ function distance(a, b) {
   if (!a) return b.length;
   if (!b) return a.length;
 
-  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
 
   for (let i = 1; i <= a.length; i++) {
     const cur = [i];
@@ -61,135 +85,124 @@ function distance(a, b) {
       );
     }
 
-    for (let j = 0; j <= b.length; j++) {
-      prev[j] = cur[j];
-    }
+    prev = cur;
   }
 
   return prev[b.length];
 }
 
 function typoThreshold(word) {
-  const length = word.length;
+  const n = word.length;
 
-  if (length <= 3) return 0;
-  if (length <= 5) return 1;
-  if (length <= 8) return 2;
+  if (n <= 3) return 0;
+  if (n <= 5) return 1;
+  if (n <= 8) return 2;
+  if (n <= 12) return 3;
 
-  return Math.max(2, Math.floor(length * 0.24));
-}
-
-function fuzzySingleWordMatch(words, target) {
-  const threshold = typoThreshold(target);
-
-  if (threshold <= 0) return false;
-
-  return words.some(word => {
-    if (!word) return false;
-
-    if (word.includes(target) || target.includes(word)) {
-      return Math.abs(word.length - target.length) <= threshold;
-    }
-
-    return distance(word, target) <= threshold;
-  });
-}
-
-function fuzzyPhraseMatch(words, targetWords) {
-  if (!targetWords.length) return null;
-
-  if (targetWords.length === 1) {
-    return fuzzySingleWordMatch(words, targetWords[0]) ? 0 : null;
-  }
-
-  for (
-    let start = 0;
-    start <= words.length - targetWords.length;
-    start++
-  ) {
-    let total = 0;
-    let ok = true;
-
-    for (let i = 0; i < targetWords.length; i++) {
-      const word = words[start + i];
-      const target = targetWords[i];
-
-      const exact =
-        word === target ||
-        word.includes(target) ||
-        target.includes(word);
-
-      const d = exact ? 0 : distance(word, target);
-
-      if (d > typoThreshold(target)) {
-        ok = false;
-        break;
-      }
-
-      total += d;
-    }
-
-    if (ok) return total;
-  }
-
-  return null;
+  return Math.max(3, Math.floor(n * 0.25));
 }
 
 function keywordMatch(text, keywords) {
-  const normalized = normalizeText(text);
-  const compact = compactText(text);
+  const original = String(text || '');
+  const normalized = normalizeText(original);
+  const compact = compactText(original);
   const words = normalized.split(/\s+/).filter(Boolean);
 
-  for (const raw of keywords) {
-    const keyword = normalizeText(raw);
+  for (const rawKeyword of keywords) {
+    const keyword = normalizeText(rawKeyword);
 
     if (!keyword) continue;
 
     const keywordCompact = compactText(keyword);
 
-    if (!keywordCompact) continue;
-
-    // 1) Exact match anywhere in the whole sentence.
     if (
       normalized.includes(keyword) ||
       compact.includes(keywordCompact)
     ) {
       return {
         matched: true,
-        keyword: raw,
+        keyword: rawKeyword,
         mode: 'exact'
       };
     }
 
-    const targetWords = keyword
-      .split(/\s+/)
-      .filter(Boolean);
+    const targetWords = keyword.split(/\s+/).filter(Boolean);
 
-    // 2) Single-word typo tolerance.
-    if (
-      targetWords.length === 1 &&
-      fuzzySingleWordMatch(words, targetWords[0])
-    ) {
-      return {
-        matched: true,
-        keyword: raw,
-        mode: 'typo'
-      };
+    if (targetWords.length === 1) {
+      const target = targetWords[0];
+      const maxDistance = typoThreshold(target);
+
+      for (const word of words) {
+        if (
+          word.includes(target) ||
+          target.includes(word)
+        ) {
+          if (
+            Math.abs(word.length - target.length) <=
+            maxDistance
+          ) {
+            return {
+              matched: true,
+              keyword: rawKeyword,
+              mode: 'substring-typo'
+            };
+          }
+        }
+
+        if (
+          maxDistance > 0 &&
+          distance(word, target) <= maxDistance
+        ) {
+          return {
+            matched: true,
+            keyword: rawKeyword,
+            mode: 'typo',
+            distance: distance(word, target)
+          };
+        }
+      }
+
+      continue;
     }
 
-    // 3) Multi-word typo tolerance.
-    const phraseDistance = fuzzyPhraseMatch(
-      words,
-      targetWords
-    );
+    for (
+      let start = 0;
+      start <= words.length - targetWords.length;
+      start++
+    ) {
+      let totalDistance = 0;
+      let ok = true;
 
-    if (phraseDistance !== null) {
-      return {
-        matched: true,
-        keyword: raw,
-        mode: 'phrase-typo',
-        distance: phraseDistance
-      };
+      for (
+        let i = 0;
+        i < targetWords.length;
+        i++
+      ) {
+        const word = words[start + i];
+        const target = targetWords[i];
+
+        if (word === target) {
+          continue;
+        }
+
+        const d = distance(word, target);
+
+        if (d > typoThreshold(target)) {
+          ok = false;
+          break;
+        }
+
+        totalDistance += d;
+      }
+
+      if (ok) {
+        return {
+          matched: true,
+          keyword: rawKeyword,
+          mode: 'phrase-typo',
+          distance: totalDistance
+        };
+      }
     }
   }
 
@@ -198,50 +211,317 @@ function keywordMatch(text, keywords) {
   };
 }
 
-async function safeClick(locator, timeout = 4000) {
+function createLogger(runLog, postLog) {
+  return {
+    info(message, data = {}) {
+      const item = {
+        time: now(),
+        level: 'info',
+        message,
+        ...data
+      };
+
+      postLog.events.push(item);
+      runLog.events.push({
+        ...item,
+        postUrl: postLog.url
+      });
+
+      console.log(
+        `[${item.time}] ${message}`,
+        Object.keys(data).length ? JSON.stringify(data) : ''
+      );
+    },
+
+    warn(message, data = {}) {
+      const item = {
+        time: now(),
+        level: 'warn',
+        message,
+        ...data
+      };
+
+      postLog.events.push(item);
+      runLog.events.push({
+        ...item,
+        postUrl: postLog.url
+      });
+
+      console.warn(
+        `[${item.time}] WARN ${message}`,
+        Object.keys(data).length ? JSON.stringify(data) : ''
+      );
+    },
+
+    error(message, data = {}) {
+      const item = {
+        time: now(),
+        level: 'error',
+        message,
+        ...data
+      };
+
+      postLog.events.push(item);
+      runLog.events.push({
+        ...item,
+        postUrl: postLog.url
+      });
+
+      console.error(
+        `[${item.time}] ERROR ${message}`,
+        Object.keys(data).length ? JSON.stringify(data) : ''
+      );
+    }
+  };
+}
+
+function writeJson(filename, data) {
+  fs.writeFileSync(
+    path.join(ARTIFACTS, filename),
+    JSON.stringify(data, null, 2),
+    'utf8'
+  );
+}
+
+async function saveScreenshot(page, filename) {
+  const fullPath = path.join(
+    ARTIFACTS,
+    filename
+  );
+
+  await page.screenshot({
+    path: fullPath,
+    fullPage: false
+  });
+
+  return fullPath;
+}
+
+async function saveFullPageScreenshot(page, filename) {
+  const fullPath = path.join(
+    ARTIFACTS,
+    filename
+  );
+
+  await page.screenshot({
+    path: fullPath,
+    fullPage: true
+  });
+
+  return fullPath;
+}
+
+async function saveDiagnosticDom(page, postLog, reason) {
+  const stamp = Date.now();
+  const base = safeName(
+    `${postLog.postIndex}-${stamp}-${reason}`
+  );
+
+  const screenshot = await saveScreenshot(
+    page,
+    `debug-${base}.png`
+  );
+
+  const fullScreenshot =
+    await saveFullPageScreenshot(
+      page,
+      `debug-${base}-full.png`
+    );
+
+  const data = await page.evaluate(() => {
+    const all = Array.from(
+      document.querySelectorAll('*')
+    );
+
+    const visible = all.filter(el => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+
+      return (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    });
+
+    const scrollables = visible
+      .filter(el => {
+        const style = getComputedStyle(el);
+
+        return (
+          /(auto|scroll)/.test(style.overflowY) &&
+          el.scrollHeight >
+            el.clientHeight + 50
+        );
+      })
+      .slice(0, 50)
+      .map(el => {
+        const rect = el.getBoundingClientRect();
+
+        return {
+          tag: el.tagName,
+          id: el.id || null,
+          className:
+            typeof el.className === 'string'
+              ? el.className.slice(0, 300)
+              : null,
+          role: el.getAttribute('role'),
+          ariaLabel:
+            el.getAttribute('aria-label'),
+          scrollTop: el.scrollTop,
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+          rect: {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height
+          }
+        };
+      });
+
+    const candidateElements = visible
+      .filter(el => {
+        const text =
+          (el.innerText || '').trim();
+
+        if (!text || text.length < 2) {
+          return false;
+        }
+
+        if (text.length > 1000) {
+          return false;
+        }
+
+        return (
+          el.matches('li') ||
+          el.matches('[role="listitem"]') ||
+          el.matches('article') ||
+          el.querySelector(
+            'a[href^="/"],time,button'
+          ) !== null
+        );
+      })
+      .slice(0, 200)
+      .map(el => ({
+        tag: el.tagName,
+        role: el.getAttribute('role'),
+        ariaLabel:
+          el.getAttribute('aria-label'),
+        text: (el.innerText || '')
+          .trim()
+          .slice(0, 1000),
+        html: el.outerHTML.slice(0, 2000)
+      }));
+
+    return {
+      url: location.href,
+      title: document.title,
+      bodyText:
+        document.body?.innerText?.slice(
+          0,
+          30000
+        ) || '',
+      dialogCount:
+        document.querySelectorAll(
+          '[role="dialog"]'
+        ).length,
+      listItemCount:
+        document.querySelectorAll(
+          'li,[role="listitem"]'
+        ).length,
+      articleCount:
+        document.querySelectorAll(
+          'article'
+        ).length,
+      textareaCount:
+        document.querySelectorAll(
+          'textarea'
+        ).length,
+      contentEditableCount:
+        document.querySelectorAll(
+          '[contenteditable="true"]'
+        ).length,
+      scrollables,
+      candidateElements
+    };
+  });
+
+  const jsonName =
+    `debug-${base}.json`;
+
+  writeJson(jsonName, {
+    reason,
+    screenshot,
+    fullScreenshot,
+    capturedAt: now(),
+    data
+  });
+
+  postLog.debugArtifacts.push({
+    reason,
+    screenshot,
+    fullScreenshot,
+    json:
+      path.join(
+        ARTIFACTS,
+        jsonName
+      )
+  });
+
+  return data;
+}
+
+async function safeClick(locator, timeout = 3000) {
   try {
-    await locator.first().click({ timeout });
+    await locator.first().click({
+      timeout
+    });
+
     return true;
   } catch {
     return false;
   }
 }
 
-async function clickText(page, patterns, timeout = 3500) {
-  for (const p of patterns) {
-    const roleButtons = page.getByRole(
-      'button',
-      {
-        name: p,
-        exact: true
+async function clickText(page, patterns, timeout = 3000) {
+  for (const pattern of patterns) {
+    const candidates = [
+      page.getByRole(
+        'button',
+        {
+          name: pattern
+        }
+      ).first(),
+
+      page.getByRole(
+        'link',
+        {
+          name: pattern
+        }
+      ).first(),
+
+      page.getByText(
+        pattern
+      ).first()
+    ];
+
+    for (const locator of candidates) {
+      if (
+        await locator
+          .isVisible()
+          .catch(() => false)
+      ) {
+        if (
+          await safeClick(
+            locator,
+            timeout
+          )
+        ) {
+          return true;
+        }
       }
-    );
-
-    if (await safeClick(roleButtons, timeout)) {
-      return true;
-    }
-
-    const roleLinks = page.getByRole(
-      'link',
-      {
-        name: p,
-        exact: true
-      }
-    );
-
-    if (await safeClick(roleLinks, timeout)) {
-      return true;
-    }
-
-    const text = page.getByText(
-      p,
-      {
-        exact: true
-      }
-    );
-
-    if (await safeClick(text, timeout)) {
-      return true;
     }
   }
 
@@ -264,58 +544,47 @@ async function dismissCommonPopups(page) {
     'باشه'
   ];
 
-  for (const p of patterns) {
-    await clickText(page, [p], 800);
+  for (const text of patterns) {
+    await clickText(
+      page,
+      [text],
+      700
+    );
   }
-}
-
-async function handleMessageCategory(page) {
-  const candidates = [
-    'Primary',
-    'PRIMARY',
-    'General',
-    'GENERAL',
-    'اصلی',
-    'عمومی',
-    'Requests',
-    'درخواست‌ها'
-  ];
-
-  for (const p of candidates) {
-    if (await clickText(page, [p], 1000)) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 async function loadSession() {
-  if (env.INSTAGRAM_SESSION_B64?.trim()) {
-    const json = Buffer
-      .from(
-        env.INSTAGRAM_SESSION_B64.trim(),
-        'base64'
-      )
-      .toString('utf8');
-
-    return JSON.parse(json);
+  if (!env.INSTAGRAM_SESSION_B64?.trim()) {
+    return null;
   }
 
-  return null;
+  const json = Buffer
+    .from(
+      env.INSTAGRAM_SESSION_B64.trim(),
+      'base64'
+    )
+    .toString('utf8');
+
+  return JSON.parse(json);
 }
 
 async function login(page, context) {
   await page.goto(
     'https://www.instagram.com/',
     {
-      waitUntil: 'domcontentloaded'
+      waitUntil:
+        'domcontentloaded',
+      timeout: 30000
     }
   );
 
   await dismissCommonPopups(page);
 
-  if (page.url().includes('/accounts/login')) {
+  if (
+    page.url().includes(
+      '/accounts/login'
+    )
+  ) {
     if (
       !env.INSTAGRAM_USERNAME ||
       !env.INSTAGRAM_PASSWORD
@@ -329,19 +598,30 @@ async function login(page, context) {
       .getByLabel(
         /Phone number, username, or email/i
       )
-      .fill(env.INSTAGRAM_USERNAME);
+      .fill(
+        env.INSTAGRAM_USERNAME
+      );
 
     await page
-      .getByLabel(/Password/i)
-      .fill(env.INSTAGRAM_PASSWORD);
+      .getByLabel(
+        /Password/i
+      )
+      .fill(
+        env.INSTAGRAM_PASSWORD
+      );
 
     await clickText(
       page,
-      ['Log in', 'ورود'],
+      [
+        'Log in',
+        'ورود'
+      ],
       8000
     );
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(
+      4000
+    );
 
     if (
       /challenge|two_factor|login/.test(
@@ -349,7 +629,7 @@ async function login(page, context) {
       )
     ) {
       throw new Error(
-        'Instagram requires interactive login/2FA. Refresh INSTAGRAM_SESSION_B64 using scripts/create-auth-state.mjs.'
+        'Instagram requires interactive login/2FA. Refresh INSTAGRAM_SESSION_B64.'
       );
     }
   }
@@ -362,114 +642,307 @@ async function login(page, context) {
   });
 }
 
-async function getCommentsDialog(page) {
-  const dialogs = page.locator(
-    'div[role="dialog"]'
+async function pageState(page) {
+  return page.evaluate(() => {
+    const scrollables =
+      Array.from(
+        document.querySelectorAll(
+          'body *'
+        )
+      )
+        .filter(el => {
+          const style =
+            getComputedStyle(el);
+
+          return (
+            /(auto|scroll)/.test(
+              style.overflowY
+            ) &&
+            el.scrollHeight >
+              el.clientHeight + 50
+          );
+        })
+        .slice(0, 20)
+        .map(el => ({
+          tag: el.tagName,
+          role:
+            el.getAttribute('role'),
+          ariaLabel:
+            el.getAttribute(
+              'aria-label'
+            ),
+          scrollTop: el.scrollTop,
+          scrollHeight:
+            el.scrollHeight,
+          clientHeight:
+            el.clientHeight
+        }));
+
+    return {
+      url: location.href,
+      title: document.title,
+      dialogs:
+        document.querySelectorAll(
+          '[role="dialog"]'
+        ).length,
+      listItems:
+        document.querySelectorAll(
+          'li'
+        ).length,
+      roleListItems:
+        document.querySelectorAll(
+          '[role="listitem"]'
+        ).length,
+      articles:
+        document.querySelectorAll(
+          'article'
+        ).length,
+      buttons:
+        document.querySelectorAll(
+          'button'
+        ).length,
+      scrollables
+    };
+  });
+}
+
+async function openComments(page, logger) {
+  logger.info(
+    'Trying to open comments'
   );
 
-  const count = await dialogs.count();
+  const labels = [
+    /comment/i,
+    /comments/i,
+    /نظر/i,
+    /دیدگاه/i
+  ];
 
-  if (!count) return null;
-
-  return dialogs.last();
-}
-
-async function getVisibleScrollableNodes(page) {
-  return page
-    .locator('div[role="dialog"] div')
-    .evaluateAll(elements => {
-      const result = [];
-
-      for (const el of elements) {
-        const style = getComputedStyle(el);
-
-        const scrollable =
-          /(auto|scroll)/.test(
-            style.overflowY
-          ) &&
-          el.scrollHeight >
-            el.clientHeight + 50;
-
-        if (!scrollable) continue;
-
-        const rect =
-          el.getBoundingClientRect();
-
-        if (
-          rect.width < 50 ||
-          rect.height < 80
-        ) {
-          continue;
+  for (const label of labels) {
+    const candidates = [
+      page.getByLabel(label).first(),
+      page.getByRole(
+        'button',
+        {
+          name: label
         }
+      ).first()
+    ];
 
-        result.push({
-          top: rect.top,
-          height: rect.height,
-          scrollHeight: el.scrollHeight,
-          clientHeight: el.clientHeight
-        });
+    for (const locator of candidates) {
+      if (
+        await locator
+          .isVisible()
+          .catch(() => false)
+      ) {
+        if (
+          await safeClick(
+            locator,
+            3500
+          )
+        ) {
+          await page.waitForTimeout(
+            1200
+          );
+
+          const state =
+            await pageState(
+              page
+            );
+
+          logger.info(
+            'Comments control clicked',
+            state
+          );
+
+          return true;
+        }
       }
-
-      return result.sort(
-        (a, b) =>
-          (b.scrollHeight - b.clientHeight) -
-          (a.scrollHeight - a.clientHeight)
-      );
-    })
-    .catch(() => []);
-}
-
-async function scrollCommentArea(page) {
-  const dialog =
-    await getCommentsDialog(page);
-
-  if (!dialog) {
-    await page.mouse.wheel(0, 1800);
-    return;
+    }
   }
 
-  // Scroll all nested scroll containers.
-  await page
-    .locator('div[role="dialog"] div')
-    .evaluateAll(elements => {
-      for (const el of elements) {
-        const style = getComputedStyle(el);
+  const iconButtons =
+    page.locator(
+      'button,[role="button"]'
+    );
 
-        if (
+  const count =
+    await iconButtons.count();
+
+  for (
+    let i = 0;
+    i < Math.min(count, 40);
+    i++
+  ) {
+    const button =
+      iconButtons.nth(i);
+
+    const label =
+      await button
+        .getAttribute(
+          'aria-label'
+        )
+        .catch(
+          () => ''
+        );
+
+    if (
+      /comment|نظر|دیدگاه/i.test(
+        String(label || '')
+      )
+    ) {
+      if (
+        await safeClick(
+          button,
+          2500
+        )
+      ) {
+        await page.waitForTimeout(
+          1200
+        );
+
+        logger.info(
+          'Comments opened via aria-label fallback',
+          {
+            ariaLabel: label
+          }
+        );
+
+        return true;
+      }
+    }
+  }
+
+  logger.warn(
+    'Could not positively identify a comments control; continuing with DOM diagnostics'
+  );
+
+  return false;
+}
+
+async function getScrollableContainers(page) {
+  return page.evaluate(() => {
+    return Array.from(
+      document.querySelectorAll(
+        'body *'
+      )
+    )
+      .filter(el => {
+        const style =
+          getComputedStyle(el);
+
+        return (
           /(auto|scroll)/.test(
             style.overflowY
           ) &&
           el.scrollHeight >
             el.clientHeight + 50
+        );
+      })
+      .map((el, index) => {
+        const rect =
+          el.getBoundingClientRect();
+
+        return {
+          index,
+          tag:
+            el.tagName,
+          role:
+            el.getAttribute(
+              'role'
+            ),
+          ariaLabel:
+            el.getAttribute(
+              'aria-label'
+            ),
+          className:
+            typeof el.className ===
+            'string'
+              ? el.className.slice(
+                  0,
+                  200
+                )
+              : '',
+          scrollTop:
+            el.scrollTop,
+          scrollHeight:
+            el.scrollHeight,
+          clientHeight:
+            el.clientHeight,
+          width:
+            rect.width,
+          height:
+            rect.height
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.scrollHeight -
+            b.clientHeight) -
+          (a.scrollHeight -
+            a.clientHeight)
+      )
+      .slice(0, 15);
+  });
+}
+
+async function scrollEverything(page) {
+  return page.evaluate(
+    scrollPixels => {
+      const elements =
+        Array.from(
+          document.querySelectorAll(
+            'body *'
+          )
+        );
+
+      let changed = 0;
+
+      for (const el of elements) {
+        const style =
+          getComputedStyle(el);
+
+        if (
+          !/(auto|scroll)/.test(
+            style.overflowY
+          )
         ) {
-          el.scrollTop += Math.max(
-            700,
-            Math.floor(
-              el.clientHeight * 0.85
-            )
+          continue;
+        }
+
+        if (
+          el.scrollHeight <=
+          el.clientHeight + 50
+        ) {
+          continue;
+        }
+
+        const before =
+          el.scrollTop;
+
+        el.scrollTop =
+          Math.min(
+            el.scrollTop +
+              scrollPixels,
+            el.scrollHeight
           );
+
+        if (
+          el.scrollTop !== before
+        ) {
+          changed++;
         }
       }
-    })
-    .catch(() => {});
 
-  // Scroll dialog itself.
-  await dialog
-    .evaluate(el => {
-      el.scrollTop += Math.max(
-        700,
-        Math.floor(
-          el.clientHeight * 0.85
-        )
+      window.scrollBy(
+        0,
+        scrollPixels
       );
-    })
-    .catch(() => {});
 
-  // Fallback page scroll.
-  await page.mouse.wheel(0, 1200);
-
-  // Let Instagram fetch more comments.
-  await page.waitForTimeout(850);
+      return changed;
+    },
+    SCROLL_PIXELS
+  );
 }
 
 async function clickMoreComments(page) {
@@ -477,6 +950,7 @@ async function clickMoreComments(page) {
     /View more comments/i,
     /Load more comments/i,
     /View all \d+ comments/i,
+    /View all comments/i,
     /نمایش نظرهای بیشتر/i,
     /نمایش دیدگاه‌های بیشتر/i,
     /مشاهده همه.*نظر/i,
@@ -484,40 +958,45 @@ async function clickMoreComments(page) {
   ];
 
   for (const pattern of patterns) {
-    const candidates = [
-      page
-        .getByText(pattern)
-        .last(),
-
-      page
-        .getByRole(
-          'button',
-          { name: pattern }
-        )
-        .last(),
-
-      page
-        .getByRole(
-          'link',
-          { name: pattern }
-        )
-        .last()
+    const elements = [
+      page.getByRole(
+        'button',
+        {
+          name: pattern
+        }
+      ),
+      page.getByText(
+        pattern
+      )
     ];
 
-    for (const candidate of candidates) {
-      if (
-        await candidate
-          .isVisible()
-          .catch(() => false)
+    for (const locator of elements) {
+      const count =
+        await locator.count();
+
+      for (
+        let i = 0;
+        i < count;
+        i++
       ) {
+        const item =
+          locator.nth(i);
+
         if (
-          await safeClick(
-            candidate,
-            1800
-          )
+          await item
+            .isVisible()
+            .catch(
+              () => false
+            )
         ) {
-          await page.waitForTimeout(700);
-          return true;
+          if (
+            await safeClick(
+              item,
+              1800
+            )
+          ) {
+            return true;
+          }
         }
       }
     }
@@ -526,55 +1005,454 @@ async function clickMoreComments(page) {
   return false;
 }
 
-function isUsefulCommentText(text) {
-  const normalized =
-    normalizeText(text);
+async function extractCommentCandidates(page) {
+  return page.evaluate(() => {
+    const normalize = value =>
+      String(value || '')
+        .normalize('NFKC')
+        .toLocaleLowerCase('fa')
+        .replace(
+          /[\u200b\u200c\u200d\ufeff]/g,
+          ''
+        )
+        .replace(
+          /[ًٌٍَُِّْـ]/g,
+          ''
+        )
+        .replace(/ي/g, 'ی')
+        .replace(/ك/g, 'ک')
+        .replace(
+          /[\p{P}\p{S}]+/gu,
+          ' '
+        )
+        .replace(
+          /\s+/g,
+          ' '
+        )
+        .trim();
 
-  if (
-    !normalized ||
-    normalized.length < 2
-  ) {
-    return false;
-  }
+    const nodes =
+      Array.from(
+        document.querySelectorAll(
+          'li,[role="listitem"],article,div'
+        )
+      );
 
-  const blocked = [
-    /^add a comment$/i,
-    /^write a comment$/i,
-    /^comment$/i,
-    /^reply$/i,
-    /^پاسخ$/i,
-    /^نظر$/i,
-    /^دیدگاه$/i,
-    /^log in$/i,
-    /^follow$/i
-  ];
+    const result = [];
+    const seen = new Set();
 
-  return !blocked.some(
-    re => re.test(normalized)
-  );
+    for (const el of nodes) {
+      const text =
+        (el.innerText || '')
+          .trim();
+
+      if (
+        !text ||
+        text.length < 2 ||
+        text.length > 1000
+      ) {
+        continue;
+      }
+
+      const normalized =
+        normalize(text);
+
+      if (
+        !normalized ||
+        normalized.length < 2
+      ) {
+        continue;
+      }
+
+      const links =
+        Array.from(
+          el.querySelectorAll(
+            'a[href^="/"]'
+          )
+        );
+
+      const profileLinks =
+        links
+          .map(a =>
+            a.getAttribute(
+              'href'
+            )
+          )
+          .filter(Boolean)
+          .filter(href =>
+            /^\/[^/]+\/?$/.test(
+              href
+            )
+          );
+
+      const hasTime =
+        el.querySelector(
+          'time'
+        ) !== null;
+
+      const hasReplyText =
+        /(^|\n)\s*(reply|repl(y|ies)|پاسخ)\s*($|\n)/i.test(
+          text
+        );
+
+      const hasLikeButton =
+        el.querySelector(
+          'button,[role="button"]'
+        ) !== null;
+
+      if (
+        !(
+          profileLinks.length ||
+          hasTime ||
+          hasReplyText ||
+          hasLikeButton
+        )
+      ) {
+        continue;
+      }
+
+      const key = normalized;
+
+      if (
+        seen.has(key)
+      ) {
+        continue;
+      }
+
+      seen.add(key);
+
+      result.push({
+        text,
+        normalized,
+        profilePath:
+          profileLinks[0] ||
+          null,
+        hasTime,
+        hasReplyText,
+        hasLikeButton,
+        tagName:
+          el.tagName,
+        role:
+          el.getAttribute(
+            'role'
+          ),
+        html:
+          el.outerHTML.slice(
+            0,
+            2500
+          )
+      });
+    }
+
+    return result;
+  });
 }
 
-async function findCommentRows(page) {
-  const dialog =
-    await getCommentsDialog(page);
+async function scanComments(
+  page,
+  postLog,
+  logger
+) {
+  const commentsByKey =
+    new Map();
 
-  if (!dialog) return [];
+  let sameRounds = 0;
+  let previousSignature = '';
+  let rounds = 0;
 
-  const selectors = [
-    'ul > li',
-    'li',
-    '[role="listitem"]'
+  logger.info(
+    'Starting full comment scan',
+    {
+      maxRounds:
+        MAX_SCAN_ROUNDS,
+      scrollPixels:
+        SCROLL_PIXELS
+    }
+  );
+
+  for (
+    rounds = 1;
+    rounds <= MAX_SCAN_ROUNDS;
+    rounds++
+  ) {
+    const clicked =
+      await clickMoreComments(
+        page
+      );
+
+    const candidates =
+      await extractCommentCandidates(
+        page
+      );
+
+    let added = 0;
+
+    for (const candidate of candidates) {
+      const key =
+        compactText(
+          candidate.text
+        );
+
+      if (
+        !key ||
+        commentsByKey.has(key)
+      ) {
+        continue;
+      }
+
+      commentsByKey.set(
+        key,
+        candidate
+      );
+
+      added++;
+    }
+
+    const containers =
+      await getScrollableContainers(
+        page
+      );
+
+    const beforeCount =
+      commentsByKey.size;
+
+    const screenshotName =
+      `comments-round-${String(
+        postLog.postIndex
+      ).padStart(2, '0')}-${String(
+        rounds
+      ).padStart(3, '0')}.png`;
+
+    if (
+      DEBUG_SCREENSHOT_EVERY_ROUND ||
+      rounds === 1
+    ) {
+      const screenshot =
+        await saveScreenshot(
+          page,
+          screenshotName
+        );
+
+      postLog.roundScreenshots.push(
+        {
+          round: rounds,
+          screenshot
+        }
+      );
+    }
+
+    const changed =
+      await scrollEverything(
+        page
+      );
+
+    await page.waitForTimeout(
+      1100
+    );
+
+    const afterCandidates =
+      await extractCommentCandidates(
+        page
+      );
+
+    for (
+      const candidate of
+      afterCandidates
+    ) {
+      const key =
+        compactText(
+          candidate.text
+        );
+
+      if (
+        key &&
+        !commentsByKey.has(key)
+      ) {
+        commentsByKey.set(
+          key,
+          candidate
+        );
+
+        added++;
+      }
+    }
+
+    const signature =
+      JSON.stringify({
+        count:
+          commentsByKey.size,
+        containers:
+          containers.map(
+            c => ({
+              scrollTop:
+                c.scrollTop,
+              scrollHeight:
+                c.scrollHeight,
+              clientHeight:
+                c.clientHeight
+            })
+          )
+      });
+
+    if (
+      signature ===
+      previousSignature &&
+      added === 0 &&
+      !clicked
+    ) {
+      sameRounds++;
+    } else {
+      sameRounds = 0;
+    }
+
+    previousSignature =
+      signature;
+
+    logger.info(
+      'Comment scan round',
+      {
+        round: rounds,
+        visibleCandidates:
+          candidates.length,
+        addedThisRound:
+          added,
+        totalUniqueComments:
+          commentsByKey.size,
+        scrollableContainers:
+          containers.length,
+        changedContainers:
+          changed,
+        clickedMoreComments:
+          clicked,
+        sameRounds
+      }
+    );
+
+    postLog.rounds.push({
+      round: rounds,
+      visibleCandidates:
+        candidates.length,
+      addedThisRound:
+        added,
+      totalUniqueComments:
+        commentsByKey.size,
+      scrollableContainers:
+        containers.length,
+      changedContainers:
+        changed,
+      clickedMoreComments:
+        clicked,
+      sameRounds
+    });
+
+    if (sameRounds >= 5) {
+      logger.info(
+        'Comment scan stopped because DOM/scroll state became stable',
+        {
+          rounds,
+          totalUniqueComments:
+            commentsByKey.size
+        }
+      );
+
+      break;
+    }
+
+    if (
+      commentsByKey.size ===
+      beforeCount &&
+      changed === 0 &&
+      !clicked
+    ) {
+      sameRounds++;
+
+      if (sameRounds >= 5) {
+        break;
+      }
+    }
+  }
+
+  const finalScreenshot =
+    await saveScreenshot(
+      page,
+      `comments-final-${postLog.postIndex}.png`
+    );
+
+  const finalFullScreenshot =
+    await saveFullPageScreenshot(
+      page,
+      `comments-final-${postLog.postIndex}-full.png`
+    );
+
+  const allComments =
+    Array.from(
+      commentsByKey.values()
+    );
+
+  postLog.commentsScreenshot =
+    finalScreenshot;
+
+  postLog.commentsFullScreenshot =
+    finalFullScreenshot;
+
+  postLog.uniqueComments =
+    allComments.length;
+
+  writeJson(
+    `comments-${postLog.postIndex}.json`,
+    {
+      capturedAt: now(),
+      url:
+        postLog.url,
+      comments:
+        allComments
+    }
+  );
+
+  logger.info(
+    'Full comment scan finished',
+    {
+      rounds,
+      uniqueComments:
+        allComments.length,
+      finalScreenshot,
+      finalFullScreenshot
+    }
+  );
+
+  return allComments;
+}
+
+async function findCommentElement(
+  page,
+  targetText,
+  logger
+) {
+  const target =
+    compactText(
+      targetText
+    );
+
+  if (!target) {
+    return null;
+  }
+
+  const locators = [
+    page.locator('li'),
+    page.locator('[role="listitem"]'),
+    page.locator('article'),
+    page.locator('div')
   ];
 
-  const found = [];
-  const seen = new Set();
-
-  for (const selector of selectors) {
-    const locator =
-      dialog.locator(selector);
-
+  for (
+    const locator of
+    locators
+  ) {
     const count =
-      await locator.count();
+      Math.min(
+        await locator.count(),
+        500
+      );
 
     for (
       let i = 0;
@@ -585,9 +1463,11 @@ async function findCommentRows(page) {
         locator.nth(i);
 
       if (
-        await row
+        !(await row
           .isVisible()
-          .catch(() => false) === false
+          .catch(
+            () => false
+          ))
       ) {
         continue;
       }
@@ -598,432 +1478,60 @@ async function findCommentRows(page) {
           .catch(() => '');
 
       if (
-        !isUsefulCommentText(text)
+        compactText(
+          text
+        ) === target
       ) {
-        continue;
-      }
+        logger.info(
+          'Matched comment element found',
+          {
+            index: i
+          }
+        );
 
-      const normalized =
-        normalizeText(text);
-
-      // Avoid duplicate nested li nodes.
-      const key =
-        compactText(normalized);
-
-      if (
-        key.length < 2 ||
-        seen.has(key)
-      ) {
-        continue;
-      }
-
-      // Comments almost always contain a username anchor,
-      // timestamp, reply button, or like control.
-      const hasAuthor =
-        await row
-          .locator('a[href^="/"]')
-          .count() > 0;
-
-      const hasReply =
-        await row
-          .getByText(
-            /^(Reply|پاسخ)$/i
-          )
-          .count() > 0;
-
-      const hasButton =
-        await row
-          .locator(
-            'button,[role="button"]'
-          )
-          .count() > 0;
-
-      if (
-        !hasAuthor &&
-        !hasReply &&
-        !hasButton
-      ) {
-        continue;
-      }
-
-      seen.add(key);
-      found.push(row);
-    }
-
-    if (found.length) {
-      break;
-    }
-  }
-
-  return found;
-}
-
-async function getCommentScrollFingerprint(page) {
-  const dialog =
-    await getCommentsDialog(page);
-
-  const dialogState =
-    await dialog
-      ?.evaluate(el => ({
-        scrollTop: el.scrollTop,
-        scrollHeight: el.scrollHeight,
-        clientHeight: el.clientHeight
-      }))
-      .catch(() => null);
-
-  const nestedState =
-    await page
-      .locator(
-        'div[role="dialog"] div'
-      )
-      .evaluateAll(elements => {
-        return elements
-          .map(el => {
-            const style =
-              getComputedStyle(el);
-
-            if (
-              !/(auto|scroll)/.test(
-                style.overflowY
-              )
-            ) {
-              return null;
-            }
-
-            return {
-              scrollTop: el.scrollTop,
-              scrollHeight:
-                el.scrollHeight,
-              clientHeight:
-                el.clientHeight
-            };
-          })
-          .filter(Boolean)
-          .filter(
-            x =>
-              x.scrollHeight >
-              x.clientHeight + 50
-          );
-      })
-      .catch(() => []);
-
-  return JSON.stringify({
-    dialog: dialogState,
-    nested: nestedState
-  });
-}
-
-async function scrollCommentsToTop(page) {
-  const dialog =
-    await getCommentsDialog(page);
-
-  if (!dialog) return;
-
-  await page
-    .locator('div[role="dialog"] div')
-    .evaluateAll(elements => {
-      for (const el of elements) {
-        const style =
-          getComputedStyle(el);
-
-        if (
-          /(auto|scroll)/.test(
-            style.overflowY
-          )
-        ) {
-          el.scrollTop = 0;
-        }
-      }
-    })
-    .catch(() => {});
-
-  await dialog
-    .evaluate(el => {
-      el.scrollTop = 0;
-    })
-    .catch(() => {});
-
-  await page.waitForTimeout(500);
-}
-
-async function loadAllComments(page) {
-  const seen = new Map();
-
-  let stableRounds = 0;
-  let atEndRounds = 0;
-  let lastFingerprint = '';
-
-  const MAX_ROUNDS = 90;
-
-  let rounds = 0;
-
-  for (
-    rounds = 0;
-    rounds < MAX_ROUNDS;
-    rounds++
-  ) {
-    const clickedMore =
-      await clickMoreComments(page);
-
-    const rows =
-      await findCommentRows(page);
-
-    for (const row of rows) {
-      const text =
-        await row
-          .innerText()
-          .catch(() => '');
-
-      if (
-        !isUsefulCommentText(text)
-      ) {
-        continue;
-      }
-
-      const key =
-        compactText(text);
-
-      if (
-        key.length < 2 ||
-        seen.has(key)
-      ) {
-        continue;
-      }
-
-      seen.set(key, text);
-    }
-
-    const before =
-      await getCommentScrollFingerprint(
-        page
-      );
-
-    await scrollCommentArea(page);
-
-    const after =
-      await getCommentScrollFingerprint(
-        page
-      );
-
-    if (after === before) {
-      atEndRounds += 1;
-    } else {
-      atEndRounds = 0;
-    }
-
-    if (
-      after === lastFingerprint &&
-      !clickedMore
-    ) {
-      stableRounds += 1;
-    } else {
-      stableRounds = 0;
-    }
-
-    lastFingerprint = after;
-
-    if (
-      atEndRounds >= 3 &&
-      stableRounds >= 3
-    ) {
-      break;
-    }
-
-    if (clickedMore) {
-      stableRounds = 0;
-      atEndRounds = 0;
-
-      await page.waitForTimeout(
-        1000
-      );
-    }
-  }
-
-  return {
-    rounds,
-    stableRounds,
-    uniqueCommentsScanned:
-      seen.size,
-    comments: [
-      ...seen.entries()
-    ].map(
-      ([key, text]) => ({
-        key,
-        text
-      })
-    )
-  };
-}
-
-async function findCommentRowByText(
-  page,
-  targetText
-) {
-  const target =
-    compactText(targetText);
-
-  if (!target) return null;
-
-  await scrollCommentsToTop(page);
-
-  let stableRounds = 0;
-  let lastFingerprint = '';
-
-  for (
-    let round = 0;
-    round < 60;
-    round++
-  ) {
-    const rows =
-      await findCommentRows(page);
-
-    for (const row of rows) {
-      const text =
-        await row
-          .innerText()
-          .catch(() => '');
-
-      if (
-        compactText(text) ===
-        target
-      ) {
         return row;
       }
-    }
-
-    const before =
-      await getCommentScrollFingerprint(
-        page
-      );
-
-    await scrollCommentArea(page);
-
-    const after =
-      await getCommentScrollFingerprint(
-        page
-      );
-
-    if (
-      after === before ||
-      after === lastFingerprint
-    ) {
-      stableRounds += 1;
-    } else {
-      stableRounds = 0;
-    }
-
-    lastFingerprint = after;
-
-    if (stableRounds >= 4) {
-      break;
     }
   }
 
   return null;
 }
 
-async function openComments(page) {
-  await dismissCommonPopups(page);
-
-  const candidates = [
-    page
-      .getByLabel(
-        /comment|comments|نظر|دیدگاه/i
-      )
-      .first(),
-
-    page
-      .getByRole(
-        'button',
-        {
-          name:
-            /comment|comments|نظر|دیدگاه/i
-        }
-      )
-      .first(),
-
-    page
+async function getAuthorProfile(
+  row
+) {
+  const hrefs =
+    await row
       .locator(
-        '[aria-label*="comment" i]'
+        'a[href^="/"]'
       )
-      .first(),
-
-    page
-      .locator(
-        '[aria-label*="نظر" i]'
+      .evaluateAll(
+        anchors =>
+          anchors
+            .map(
+              a =>
+                a.getAttribute(
+                  'href'
+                )
+            )
+            .filter(Boolean)
       )
-      .first(),
+      .catch(() => []);
 
-    page
-      .locator(
-        '[aria-label*="دیدگاه" i]'
-      )
-      .first()
-  ];
-
-  for (
-    const candidate of candidates
-  ) {
+  for (const href of hrefs) {
     if (
-      await candidate
-        .isVisible()
-        .catch(() => false) &&
-      await safeClick(
-        candidate,
-        3000
+      /^\/[^/]+\/?$/.test(
+        href
+      ) &&
+      !/^\/(explore|reels|direct|accounts)/.test(
+        href
       )
     ) {
-      await page.waitForTimeout(
-        1200
-      );
-
-      if (
-        await getCommentsDialog(
-          page
-        )
-      ) {
-        return true;
-      }
+      return href;
     }
   }
 
-  // Broad fallback for icon buttons.
-  const svgButtons =
-    page.locator(
-      'div[role="button"]:has(svg)'
-    );
-
-  const count =
-    await svgButtons.count();
-
-  for (
-    let i = 0;
-    i < Math.min(count, 12);
-    i++
-  ) {
-    if (
-      await safeClick(
-        svgButtons.nth(i),
-        1200
-      )
-    ) {
-      await page.waitForTimeout(
-        800
-      );
-
-      if (
-        await getCommentsDialog(
-          page
-        )
-      ) {
-        return true;
-      }
-    }
-  }
-
-  throw new Error(
-    'Comment control was not found or the comments dialog did not open.'
-  );
+  return null;
 }
 
 async function replyToComment(
@@ -1031,60 +1539,52 @@ async function replyToComment(
   row,
   replyText
 ) {
-  const replyCandidates = [
-    row
-      .getByRole(
-        'button',
-        {
-          name:
-            /reply|پاسخ/i
-        }
-      )
-      .first(),
+  const reply =
+    row.getByText(
+      /^(Reply|reply|پاسخ)$/i
+    ).first();
 
-    row
-      .getByText(
-        /^(Reply|reply|پاسخ)$/ 
-      )
-      .first(),
-
-    row
-      .locator('button')
-      .filter({
-        hasText:
-          /reply|پاسخ/i
-      })
-      .first()
-  ];
-
-  let opened = false;
-
-  for (
-    const candidate of
-    replyCandidates
+  if (
+    await reply
+      .isVisible()
+      .catch(() => false)
   ) {
     if (
-      await candidate
-        .isVisible()
-        .catch(() => false) &&
-      await safeClick(
-        candidate,
-        2500
-      )
+      !(await safeClick(
+        reply,
+        3000
+      ))
     ) {
-      opened = true;
-      break;
+      throw new Error(
+        'Reply control could not be clicked.'
+      );
+    }
+  } else {
+    const button =
+      row
+        .getByRole(
+          'button',
+          {
+            name:
+              /reply|پاسخ/i
+          }
+        )
+        .first();
+
+    if (
+      !(await safeClick(
+        button,
+        3000
+      ))
+    ) {
+      throw new Error(
+        'Reply control was not found for matched comment.'
+      );
     }
   }
 
-  if (!opened) {
-    throw new Error(
-      'Reply control was not found for matched comment.'
-    );
-  }
-
   await page.waitForTimeout(
-    400
+    500
   );
 
   const inputs = [
@@ -1095,7 +1595,9 @@ async function replyToComment(
       .last(),
 
     page
-      .locator('textarea')
+      .locator(
+        'textarea'
+      )
       .last(),
 
     page
@@ -1105,20 +1607,20 @@ async function replyToComment(
       .last()
   ];
 
-  for (
-    const input of inputs
-  ) {
+  for (const input of inputs) {
     if (
       await input
         .isVisible()
-        .catch(() => false)
+        .catch(
+          () => false
+        )
     ) {
       await input.fill(
         replyText
       );
 
-      const sent =
-        await clickText(
+      if (
+        !(await clickText(
           page,
           [
             'Post',
@@ -1128,9 +1630,8 @@ async function replyToComment(
             'پاسخ'
           ],
           3000
-        );
-
-      if (!sent) {
+        ))
+      ) {
         await input.press(
           'Enter'
         );
@@ -1149,56 +1650,33 @@ async function replyToComment(
   );
 }
 
-async function getAuthorProfile(
-  page,
-  row
+async function handleMessageCategory(
+  page
 ) {
-  const links =
-    row
-      .locator(
-        'a[href^="/"]'
-      )
-      .filter({
-        hasText: /./
-      });
+  const candidates = [
+    'Primary',
+    'PRIMARY',
+    'General',
+    'GENERAL',
+    'اصلی',
+    'عمومی',
+    'Requests',
+    'درخواست‌ها'
+  ];
 
-  const count =
-    await links.count();
-
-  for (
-    let i = 0;
-    i < count;
-    i++
-  ) {
-    const href =
-      await links
-        .nth(i)
-        .getAttribute(
-          'href'
-        );
-
+  for (const text of candidates) {
     if (
-      href &&
-      /^\/[^/]+\/?$/.test(
-        href
-      ) &&
-      !/^\/(explore|reels|direct)/.test(
-        href
+      await clickText(
+        page,
+        [text],
+        1000
       )
     ) {
-      return href;
+      return true;
     }
   }
 
-  return await row
-    .locator('a')
-    .first()
-    .getAttribute(
-      'href'
-    )
-    .catch(
-      () => null
-    );
+  return false;
 }
 
 async function sendDmToProfile(
@@ -1218,7 +1696,8 @@ async function sendDmToProfile(
     ).href,
     {
       waitUntil:
-        'domcontentloaded'
+        'domcontentloaded',
+      timeout: 30000
     }
   );
 
@@ -1234,43 +1713,50 @@ async function sendDmToProfile(
     await clickText(
       page,
       [
-        'Message',
-        'Send message',
-        'پیام'
+        /Message/i,
+        /Send message/i,
+        /پیام/i
       ],
       3000
     );
 
   if (!messageFound) {
     const more =
-      page
-        .getByLabel(
-          /More options|گزینه‌های بیشتر/i
-        )
-        .first();
+      page.getByLabel(
+        /More options|گزینه‌های بیشتر/i
+      ).first();
 
     if (
       !(await safeClick(
         more,
-        2500
+        2200
       ))
     ) {
-      const dots =
-        page
-          .locator(
-            '[role="button"]'
-          )
-          .filter({
-            has:
-              page.locator(
-                'svg'
-              )
-          });
+      const candidates =
+        page.locator(
+          '[role="button"]'
+        );
 
-      await safeClick(
-        dots.last(),
-        2500
-      );
+      const count =
+        await candidates.count();
+
+      for (
+        let i = Math.max(
+          0,
+          count - 8
+        );
+        i < count;
+        i++
+      ) {
+        if (
+          await safeClick(
+            candidates.nth(i),
+            1000
+          )
+        ) {
+          break;
+        }
+      }
     }
 
     await page.waitForTimeout(
@@ -1281,9 +1767,9 @@ async function sendDmToProfile(
       await clickText(
         page,
         [
-          'Message',
-          'Send message',
-          'پیام'
+          /Message/i,
+          /Send message/i,
+          /پیام/i
         ],
         3000
       );
@@ -1291,7 +1777,7 @@ async function sendDmToProfile(
 
   if (!messageFound) {
     throw new Error(
-      'Message control was not found on author profile.'
+      'Message control was not found on profile.'
     );
   }
 
@@ -1325,13 +1811,13 @@ async function sendDmToProfile(
       .last()
   ];
 
-  for (
-    const input of inputs
-  ) {
+  for (const input of inputs) {
     if (
       await input
         .isVisible()
-        .catch(() => false)
+        .catch(
+          () => false
+        )
     ) {
       await input.fill(
         dmText
@@ -1353,7 +1839,7 @@ async function sendDmToProfile(
       }
 
       await page.waitForTimeout(
-        800
+        900
       );
 
       return;
@@ -1371,125 +1857,245 @@ async function processPost(
   keywords,
   commentReply,
   dmReply,
-  runLog
+  runLog,
+  postIndex
 ) {
+  const postLog = {
+    postIndex,
+    url,
+    startedAt: now(),
+    events: [],
+    rounds: [],
+    roundScreenshots: [],
+    debugArtifacts: [],
+    matches: [],
+    errors: []
+  };
+
+  const logger =
+    createLogger(
+      runLog,
+      postLog
+    );
+
+  runLog.posts.push(
+    postLog
+  );
+
+  logger.info(
+    'Opening post'
+  );
+
   await page.goto(
     url,
     {
       waitUntil:
-        'domcontentloaded'
+        'domcontentloaded',
+      timeout: 30000
     }
   );
 
   await page.waitForTimeout(
-    1200
+    1800
   );
 
-  await openComments(page);
+  logger.info(
+    'Post loaded',
+    {
+      state:
+        await pageState(
+          page
+        )
+    }
+  );
 
-  const scanStats =
-    await loadAllComments(
-      page
+  await saveDiagnosticDom(
+    page,
+    postLog,
+    'after-post-load'
+  );
+
+  await openComments(
+    page,
+    logger
+  );
+
+  await page.waitForTimeout(
+    1000
+  );
+
+  postLog.commentsOpenScreenshot =
+    await saveScreenshot(
+      page,
+      `comments-open-${postIndex}.png`
     );
 
-  const matchedComments = [];
-  const seenMatchKeys =
-    new Set();
+  postLog.commentsOpenFullScreenshot =
+    await saveFullPageScreenshot(
+      page,
+      `comments-open-${postIndex}-full.png`
+    );
+
+  await saveDiagnosticDom(
+    page,
+    postLog,
+    'comments-open'
+  );
+
+  const allComments =
+    await scanComments(
+      page,
+      postLog,
+      logger
+    );
+
+  if (
+    allComments.length === 0
+  ) {
+    logger.error(
+      'ZERO comments extracted after full scan'
+    );
+
+    await saveDiagnosticDom(
+      page,
+      postLog,
+      'zero-comments'
+    );
+
+    postLog.commentCountScanned =
+      0;
+
+    postLog.matches = [];
+    postLog.finishedAt = now();
+
+    return;
+  }
+
+  const matches = [];
 
   for (
-    const entry of
-    scanStats.comments
+    const comment of
+    allComments
   ) {
     const match =
       keywordMatch(
-        entry.text,
+        comment.text,
         keywords
       );
 
-    if (!match.matched) {
-      continue;
-    }
-
-    const key =
-      `${entry.key}|${match.keyword}`;
+    logger.info(
+      'Keyword evaluation',
+      {
+        comment:
+          comment.text,
+        matched:
+          match.matched,
+        keyword:
+          match.keyword ||
+          null,
+        mode:
+          match.mode ||
+          null,
+        distance:
+          match.distance ||
+          0
+      }
+    );
 
     if (
-      seenMatchKeys.has(key)
+      match.matched
     ) {
-      continue;
+      matches.push({
+        ...comment,
+        match
+      });
     }
-
-    seenMatchKeys.add(key);
-
-    matchedComments.push({
-      text: entry.text,
-      match
-    });
   }
 
-  const snapshot = [];
+  postLog.commentCountScanned =
+    allComments.length;
+
+  postLog.matchCount =
+    matches.length;
+
+  logger.info(
+    'Keyword scan finished',
+    {
+      comments:
+        allComments.length,
+      matches:
+        matches.length
+    }
+  );
 
   for (
     let index = 0;
-    index <
-      matchedComments.length;
+    index < matches.length;
     index++
   ) {
-    const candidate =
-      matchedComments[index];
+    const match =
+      matches[index];
 
     const item = {
-      url,
       index,
-      keyword:
-        candidate.match.keyword,
-      matchMode:
-        candidate.match.mode,
-      matchDistance:
-        candidate.match.distance ??
-        0,
       comment:
-        candidate.text,
-      authorPath: null,
+        match.text,
+      keyword:
+        match.match.keyword,
+      matchMode:
+        match.match.mode,
+      matchDistance:
+        match.match.distance ||
+        0,
       status:
         'pending'
     };
 
     try {
-      // Re-open post for every match.
-      await page.goto(
-        url,
+      logger.info(
+        'Processing matched comment',
         {
-          waitUntil:
-            'domcontentloaded'
+          index,
+          comment:
+            match.text,
+          keyword:
+            match.match.keyword
         }
       );
 
-      await page.waitForTimeout(
-        900
-      );
-
-      await openComments(
-        page
-      );
-
       const row =
-        await findCommentRowByText(
+        await findCommentElement(
           page,
-          candidate.text
+          match.text,
+          logger
         );
 
       if (!row) {
         throw new Error(
-          'Matched comment disappeared or could not be located after full scroll.'
+          'Matched comment text was collected, but its DOM element could not be located again.'
         );
       }
 
-      item.authorPath =
+      const authorPath =
         await getAuthorProfile(
-          page,
           row
         );
+
+      item.authorPath =
+        authorPath;
+
+      logger.info(
+        'Author profile resolved',
+        {
+          authorPath
+        }
+      );
+
+      if (!authorPath) {
+        throw new Error(
+          'Author profile link was not found.'
+        );
+      }
 
       await replyToComment(
         page,
@@ -1500,23 +2106,28 @@ async function processPost(
       item.commentReply =
         'sent';
 
-      if (!item.authorPath) {
-        throw new Error(
-          'Comment author profile link was not found.'
-        );
-      }
+      logger.info(
+        'Comment reply sent'
+      );
 
       await sendDmToProfile(
         page,
-        item.authorPath,
+        authorPath,
         dmReply
       );
 
-      item.dm = 'sent';
-      item.status = 'done';
+      item.dm =
+        'sent';
 
+      item.status =
+        'done';
+
+      logger.info(
+        'DM sent successfully'
+      );
     } catch (error) {
-      item.status = 'error';
+      item.status =
+        'error';
 
       item.error =
         String(
@@ -1524,47 +2135,38 @@ async function processPost(
           error
         );
 
-      const shot =
-        path.join(
-          ARTIFACTS,
-          `error-${Date.now()}-comment-${index}.png`
+      const base =
+        safeName(
+          `${postIndex}-${index}-${Date.now()}`
         );
 
-      await page
-        .screenshot({
-          path: shot,
-          fullPage: true
-        })
-        .catch(() => {});
+      const screenshot =
+        await saveFullPageScreenshot(
+          page,
+          `match-error-${base}.png`
+        );
 
-      item.screenshot = shot;
+      item.screenshot =
+        screenshot;
+
+      logger.error(
+        'Matched comment processing failed',
+        {
+          index,
+          error:
+            item.error,
+          screenshot
+        }
+      );
     }
 
-    snapshot.push(item);
+    postLog.matches.push(
+      item
+    );
   }
 
-  runLog.posts.push({
-    url,
-    commentCountScanned:
-      scanStats.uniqueCommentsScanned,
-
-    matches:
-      snapshot.length,
-
-    scanStats: {
-      rounds:
-        scanStats.rounds,
-
-      stableRounds:
-        scanStats.stableRounds,
-
-      uniqueCommentsScanned:
-        scanStats.uniqueCommentsScanned
-    },
-
-    items:
-      snapshot
-  });
+  postLog.finishedAt =
+    now();
 }
 
 async function main() {
@@ -1607,7 +2209,6 @@ async function main() {
       storageState:
         session ||
         undefined,
-
       viewport: {
         width: 1440,
         height: 1000
@@ -1618,26 +2219,47 @@ async function main() {
     await context.newPage();
 
   const runLog = {
-    startedAt:
-      new Date().toISOString(),
-
+    startedAt: now(),
     keywords,
-
+    postUrls,
+    config: {
+      maxScanRounds:
+        MAX_SCAN_ROUNDS,
+      scrollPixels:
+        SCROLL_PIXELS,
+      screenshotEveryRound:
+        DEBUG_SCREENSHOT_EVERY_ROUND
+    },
+    events: [],
     posts: [],
-
     errors: []
   };
 
   try {
+    console.log(
+      `Starting Instagram automation at ${runLog.startedAt}`
+    );
+
     await login(
       page,
       context
     );
 
+    runLog.events.push({
+      time: now(),
+      level: 'info',
+      message:
+        'Login/session initialization completed'
+    });
+
     for (
-      const url of
-      postUrls
+      let i = 0;
+      i < postUrls.length;
+      i++
     ) {
+      const url =
+        postUrls[i];
+
       try {
         await processPost(
           page,
@@ -1645,99 +2267,109 @@ async function main() {
           keywords,
           commentReply,
           dmReply,
-          runLog
+          runLog,
+          i
         );
       } catch (error) {
-        const name =
-          `error-${Date.now()}-post.png`;
+        const message =
+          String(
+            error?.message ||
+            error
+          );
 
-        await page
-          .screenshot({
-            path:
-              path.join(
-                ARTIFACTS,
-                name
-              ),
-            fullPage:
-              true
-          })
-          .catch(
-            () => {}
+        const screenshot =
+          await saveFullPageScreenshot(
+            page,
+            `post-error-${i}-${Date.now()}.png`
+          ).catch(
+            () => null
           );
 
         runLog.errors.push({
           url,
+          error: message,
+          screenshot
+        });
 
-          error:
-            String(
-              error?.message ||
-              error
-            ),
-
-          screenshot:
-            name
+        runLog.events.push({
+          time: now(),
+          level: 'error',
+          message:
+            'Post processing failed',
+          url,
+          error: message,
+          screenshot
         });
       }
     }
-
   } finally {
     runLog.finishedAt =
-      new Date().toISOString();
+      now();
+
+    writeJson(
+      'run-summary.json',
+      runLog
+    );
 
     fs.writeFileSync(
       path.join(
         ARTIFACTS,
-        'run-summary.json'
+        'automation.log'
       ),
-
-      JSON.stringify(
-        runLog,
-        null,
-        2
-      ),
-
+      runLog.events
+        .map(event =>
+          JSON.stringify(event)
+        )
+        .join('\n') +
+        '\n',
       'utf8'
     );
+
+    await context
+      .storageState({
+        path: path.join(
+          ARTIFACTS,
+          'session-after-run.json'
+        )
+      })
+      .catch(() => {});
 
     await browser.close();
   }
 
-  if (
-    runLog.errors.length ||
+  const hadErrors =
+    runLog.errors.length > 0 ||
     runLog.posts.some(
       post =>
-        post.items.some(
+        post.errors.length > 0 ||
+        post.matches.some(
           item =>
             item.status ===
             'error'
         )
-    )
-  ) {
-    process.exitCode = 1;
+    );
+
+  if (hadErrors) {
+    process.exitCode =
+      1;
   }
 }
 
 main().catch(
   error => {
-    fs.writeFileSync(
-      path.join(
-        ARTIFACTS,
-        'fatal-error.json'
-      ),
-
-      JSON.stringify(
-        {
-          error:
-            String(
-              error?.stack ||
-              error
-            )
-        },
-        null,
-        2
-      )
+    writeJson(
+      'fatal-error.json',
+      {
+        at: now(),
+        error:
+          String(
+            error?.stack ||
+            error
+          )
+      }
     );
 
-    process.exitCode = 1;
+    process.exitCode =
+      1;
   }
 );

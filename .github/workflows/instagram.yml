@@ -1,3 +1,4 @@
+# .github/workflows/instagram.yml
 name: Instagram automation
 
 on:
@@ -18,9 +19,15 @@ jobs:
       INSTAGRAM_SESSION_B64: ${{ secrets.INSTAGRAM_SESSION_B64 }}
       INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
       INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
-      INSTAGRAM_HEADLESS: "true"
+      INSTAGRAM_HEADLESS: ${{ secrets.INSTAGRAM_HEADLESS }}
+      INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS: ${{ secrets.INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS }}
+      INSTAGRAM_COMMENT_SCROLL_PIXELS: ${{ secrets.INSTAGRAM_COMMENT_SCROLL_PIXELS }}
+      INSTAGRAM_COMMENT_SCROLL_WAIT_MS: ${{ secrets.INSTAGRAM_COMMENT_SCROLL_WAIT_MS }}
+      INSTAGRAM_COMMENT_END_STABLE_ROUNDS: ${{ secrets.INSTAGRAM_COMMENT_END_STABLE_ROUNDS }}
+      INSTAGRAM_COMMENT_ROOT_TIMEOUT_MS: ${{ secrets.INSTAGRAM_COMMENT_ROOT_TIMEOUT_MS }}
+      INSTAGRAM_COMMENT_CLICK_TIMEOUT_MS: ${{ secrets.INSTAGRAM_COMMENT_CLICK_TIMEOUT_MS }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Node
@@ -34,6 +41,9 @@ jobs:
 
       - name: Install Chromium
         run: npx playwright install --with-deps chromium
+
+      - name: Syntax check
+        run: node --check src/index.mjs
 
       - name: Run Instagram engine
         run: npm run run

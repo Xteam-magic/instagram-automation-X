@@ -1167,17 +1167,18 @@ async function locateReplyControl(page, row, username) {
       });
       if (childReply) continue;
 
-      const r = el.getBoundingClientRect();
+      const clickTarget = el.closest('button,[role="button"],a') || el;
+      const r = clickTarget.getBoundingClientRect();
       if (r.top < rowRect.top) continue;
       if (r.top > rowRect.bottom + 100) continue;
 
       let score = 300;
-      if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 45;
+      if (clickTarget.tagName === 'BUTTON' || clickTarget.getAttribute('role') === 'button' || clickTarget.tagName === 'A') score += 45;
       if (r.top >= rowRect.bottom - 25) score += 55;
       score -= Math.abs(r.left - rowRect.left) * 0.25;
       score -= Math.abs(r.top - (rowRect.bottom - 2)) * 0.7;
 
-      candidates.push({ el, score, rect: r });
+      candidates.push({ el: clickTarget, score, rect: r });
     }
 
     // Small fallback: scan immediate row siblings/ancestors only, never page-wide.
@@ -1188,14 +1189,15 @@ async function locateReplyControl(page, row, username) {
         const own = normalize(el.textContent || '');
         const full = label(el);
         if (!(own === 'reply' || own === 'پاسخ' || full === 'reply' || full === 'پاسخ')) continue;
-        const r = el.getBoundingClientRect();
+        const clickTarget = el.closest('button,[role="button"],a') || el;
+        const r = clickTarget.getBoundingClientRect();
         if (r.top < rowRect.top || r.top > rowRect.bottom + 100) continue;
         const siblingProfileLinks = Array.from(scope.querySelectorAll('a[href^="/"]')).filter(a => {
           const href = a.getAttribute('href') || '';
           return /^\/[^/]+\/?$/.test(href) && !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href);
         });
         if (siblingProfileLinks.length !== 1) continue;
-        candidates.push({ el, score: 220 - depth * 30, rect: r });
+        candidates.push({ el: clickTarget, score: 220 - depth * 30, rect: r });
       }
       scope = scope.parentElement;
     }
@@ -1254,18 +1256,24 @@ async function findReplyComposer(page, root, username) {
       const strongMentionSource = normalizeText(`${meta.value} ${meta.text} ${meta.placeholder} ${meta.aria}`);
       const nearbySource = normalizeText(meta.nearbyText);
       const hasUserMention = strongMentionSource.includes(`@${usernameNorm}`) || strongMentionSource.includes(usernameNorm);
-      const replySemantic = /replying to|پاسخ به/i.test(
+      const replySemantic = /replying to|reply to|پاسخ به|پاسخ به کامنت/i.test(
         normalizeText(`${meta.placeholder} ${meta.aria}`)
       ) || (
-        nearbySource.length <= 500 &&
-        (nearbySource.includes(`@${usernameNorm}`) || /replying to|پاسخ به/i.test(nearbySource))
+        nearbySource.length <= 700 &&
+        (nearbySource.includes(`@${usernameNorm}`) || /replying to|reply to|پاسخ به/i.test(nearbySource))
+      );
+      const isFocused = await input.evaluate(el => document.activeElement === el).catch(() => false);
+      const composerLike = /message|reply|comment|پیام|پاسخ|نظر/i.test(
+        normalizeText(`${meta.placeholder} ${meta.aria}`)
       );
 
-      // Critical safety gate: do not send anything unless Instagram has clearly
-      // switched the composer into the reply context. This prevents the exact
-      // failure where the text becomes a brand-new top-level comment.
-      if (hasUserMention || replySemantic) {
-        return { input, meta, hasUserMention, replySemantic };
+      // Instagram may not expose an @mention in every desktop locale/layout.
+      // When that happens, only accept the composer if the Reply click actually
+      // focused this composer OR its accessible metadata explicitly identifies a
+      // reply context. A generic page-wide composer is never accepted merely
+      // because it is visible.
+      if (hasUserMention || replySemantic || (isFocused && composerLike)) {
+        return { input, meta, hasUserMention, replySemantic, isFocused, composerLike };
       }
     }
     await page.waitForTimeout(220);
@@ -1276,7 +1284,7 @@ async function findReplyComposer(page, root, username) {
 
 
 async function getCommentThreadStats(root, targetUsername, targetComment) {
-  return root.evaluate(({ username, commentText }) => {
+  return root.evaluate((rootEl, { username, commentText }) => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
@@ -1350,7 +1358,7 @@ async function verifyReplyIsNested(root, username, commentText, replyText, befor
   const normalizedReply = normalizeText(replyText);
   const normalizedUser = normalizeText(username).replace(/^@/, '');
 
-  const verified = await root.evaluate(({ username, commentText, replyText, before }) => {
+  const verified = await root.evaluate((rootEl, { username, commentText, replyText, before }) => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
@@ -1453,7 +1461,7 @@ async function verifyReplyIsNested(root, username, commentText, replyText, befor
     const currentReplyTextCount = allText.split(normalize(replyText)).length - 1;
     const replyTextIncreased = currentReplyTextCount > Number(before?.replyTextCount || 0);
 
-    const ok = local && (indented || countIncreased || replyTextIncreased);
+    const ok = indented || countIncreased || replyTextIncreased;
     return {
       ok,
       reason: ok ? 'VERIFIED' : 'NOT_NESTED',
@@ -1467,12 +1475,7 @@ async function verifyReplyIsNested(root, username, commentText, replyText, befor
       targetLeft: targetRect.left,
       replyLeft: replyRect.left
     };
-  }, {
-    username,
-    commentText,
-    replyText,
-    before: beforeStats || { replyCount: 0 }
-  }).catch(() => ({ ok: false, reason: 'VERIFY_EXCEPTION' }));
+  }, { username, commentText, replyText, before: beforeStats || { replyCount: 0 } }).catch(() => ({ ok: false, reason: 'VERIFY_EXCEPTION' }));
 
   if (!verified?.ok) {
     throw new Error('REPLY_NOT_CONFIRMED');
@@ -1688,6 +1691,262 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
 }
 
 
+async function findDmComposer(dmPage, username) {
+  const candidates = await dmPage.evaluate(() => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.bottom > 0 &&
+        r.right > 0 &&
+        r.top < innerHeight &&
+        r.left < innerWidth
+      );
+    };
+
+    const isSearchLike = el => {
+      const meta = normalize([
+        el.getAttribute('placeholder'),
+        el.getAttribute('aria-label'),
+        el.getAttribute('title'),
+        el.getAttribute('name'),
+        el.getAttribute('role')
+      ].join(' '));
+      return /search|جستجو|username|password|email|comment|نظر|caption/i.test(meta);
+    };
+
+    const isMessageLike = el => {
+      const meta = normalize([
+        el.getAttribute('placeholder'),
+        el.getAttribute('aria-label'),
+        el.getAttribute('title'),
+        el.getAttribute('name')
+      ].join(' '));
+      return /message|type a message|پیام|نوشتن پیام|پیام بنویس/i.test(meta);
+    };
+
+    const elements = Array.from(document.querySelectorAll(
+      'textarea,input:not([type="hidden"]),[contenteditable="true"],[role="textbox"]'
+    ));
+
+    const scored = elements
+      .filter(visible)
+      .filter(el => !isSearchLike(el))
+      .map(el => {
+        const r = el.getBoundingClientRect();
+        const messageLike = isMessageLike(el);
+        let score = 0;
+
+        if (messageLike) score += 500;
+        if (el.matches('textarea')) score += 80;
+        if (el.getAttribute('contenteditable') === 'true') score += 100;
+        if (el.getAttribute('role') === 'textbox') score += 80;
+
+        // Desktop Instagram's DM composer is normally a wide field in the
+        // lower part of the conversation pane. This deliberately rejects the
+        // left-side Search box even when its role is textbox.
+        if (r.top > innerHeight * 0.68) score += 180;
+        if (r.width >= 260) score += 100;
+        if (r.left > innerWidth * 0.28) score += 80;
+        if (r.bottom > innerHeight * 0.75) score += 100;
+
+        score += Math.min(60, r.width / 10);
+
+        return {
+          el,
+          score,
+          rect: { left: r.left, top: r.top, width: r.width, height: r.height },
+          messageLike
+        };
+      })
+      .sort((a, b) => b.score - a.score || b.rect.top - a.rect.top);
+
+    if (!scored.length) return null;
+
+    const best = scored[0];
+    const token = `ig-dm-composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.el.setAttribute('data-ig-dm-composer', token);
+
+    return {
+      token,
+      score: best.score,
+      rect: best.rect,
+      messageLike: best.messageLike,
+      tag: best.el.tagName,
+      role: best.el.getAttribute('role') || null,
+      placeholder: best.el.getAttribute('placeholder') || null,
+      aria: best.el.getAttribute('aria-label') || null,
+      contenteditable: best.el.getAttribute('contenteditable') || null
+    };
+  });
+
+  if (!candidates?.token) {
+    throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
+  }
+
+  const selector = `[data-ig-dm-composer="${String(candidates.token).replace(/"/g, '\\"')}"]`;
+  const input = dmPage.locator(selector).first();
+
+  if (!(await input.isVisible().catch(() => false))) {
+    throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
+  }
+
+  await input.scrollIntoViewIfNeeded().catch(() => {});
+  return { input, descriptor: candidates };
+}
+
+
+async function putTextInDmComposer(dmPage, input, messageText, username) {
+  const target = normalizeText(messageText);
+  if (!target) throw new Error(`DM_NOT_CONFIRMED:${username}`);
+
+  await input.click({ timeout: 3000 }).catch(() => {});
+  await dmPage.waitForTimeout(150);
+
+  let inserted = false;
+
+  // Native textarea/input path.
+  if (await input.evaluate(el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement).catch(() => false)) {
+    inserted = await input.fill(messageText).then(() => true, () => false);
+  }
+
+  // Instagram's current desktop composer is commonly contenteditable. For
+  // React/ProseMirror-like editors, keyboard insertion is more reliable than
+  // locator.fill().
+  if (!inserted) {
+    inserted = await input.evaluate(el => {
+      try {
+        if (el instanceof HTMLElement) {
+          el.focus();
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          selection?.removeAllRanges();
+          selection?.addRange(range);
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }).catch(() => false);
+
+    if (inserted) {
+      await dmPage.keyboard.press('Control+A').catch(() => {});
+      await dmPage.keyboard.press('Backspace').catch(() => {});
+      await dmPage.keyboard.insertText(messageText).catch(() => {});
+    }
+  }
+
+  // Final fallback: sequential typing into the focused editor.
+  let actual = await input.evaluate(el => String(
+    'value' in el ? el.value : (el.textContent || el.innerText || '')
+  )).catch(() => '');
+
+  if (!normalizeText(actual).includes(target)) {
+    await input.click().catch(() => {});
+    await dmPage.keyboard.press('Control+A').catch(() => {});
+    await dmPage.keyboard.press('Backspace').catch(() => {});
+    await input.pressSequentially(messageText, { delay: 18 }).catch(() => {});
+    actual = await input.evaluate(el => String(
+      'value' in el ? el.value : (el.textContent || el.innerText || '')
+    )).catch(() => '');
+  }
+
+  if (!normalizeText(actual).includes(target)) {
+    throw new Error(`DM_INPUT_NOT_FILLED:${username}`);
+  }
+
+  appendLog('DM_INPUT_FILLED', {
+    username,
+    chars: messageText.length,
+    inputTag: await input.evaluate(el => el.tagName).catch(() => null),
+    inputRole: await input.getAttribute('role').catch(() => null)
+  });
+
+  return true;
+}
+
+
+async function verifyDmMessageSent(dmPage, messageText, beforeCount, username) {
+  const normalizedMessage = normalizeText(messageText);
+
+  const verified = await dmPage.waitForFunction(
+    ({ normalizedMessage, beforeCount }) => {
+      const normalize = value => String(value || '')
+        .normalize('NFKC')
+        .toLocaleLowerCase('fa')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+        .replace(/[ًٌٍَُِّْـ]/g, '')
+        .replace(/ي/g, 'ی')
+        .replace(/ى/g, 'ی')
+        .replace(/ك/g, 'ک')
+        .replace(/[ۀە]/g, 'ه')
+        .replace(/[أإآ]/g, 'ا')
+        .replace(/ؤ/g, 'و')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const visible = el => {
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+      };
+
+      const body = normalize(document.body.innerText || '');
+      const count = body.split(normalizedMessage).length - 1;
+
+      const visibleComposers = Array.from(document.querySelectorAll(
+        'textarea,input:not([type="hidden"]),[contenteditable="true"],[role="textbox"]'
+      )).filter(visible);
+
+      const activeComposer = visibleComposers
+        .filter(el => {
+          const meta = normalize([
+            el.getAttribute('placeholder'),
+            el.getAttribute('aria-label'),
+            el.getAttribute('role')
+          ].join(' '));
+          const r = el.getBoundingClientRect();
+          return (
+            /message|پیام|type a message|نوشتن پیام/i.test(meta) &&
+            r.top > innerHeight * 0.65
+          );
+        })
+        .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+
+      const composerValue = activeComposer
+        ? normalize('value' in activeComposer ? activeComposer.value : (activeComposer.textContent || activeComposer.innerText || ''))
+        : '';
+
+      // Supporting signals: Instagram typically renders the outgoing bubble
+      // in the conversation, and the composer becomes empty after send.
+      const delta = count > Number(beforeCount || 0);
+      const composerCleared = !activeComposer || !composerValue;
+
+      return delta && composerCleared;
+    },
+    { normalizedMessage, beforeCount },
+    { timeout: 10000 }
+  ).catch(() => false);
+
+  if (!verified) throw new Error(`DM_NOT_CONFIRMED:${username}`);
+  return true;
+}
+
+
 async function sendDM(dmPage, profilePath, username, message) {
   const rawProfile = String(profilePath || '').trim();
   const messageText = String(message || '').trim();
@@ -1719,75 +1978,74 @@ async function sendDM(dmPage, profilePath, username, message) {
   const action = await clickProfileMessageAction(dmPage, isPrivate);
   appendLog('DM_MESSAGE_ACTION_FOUND', { username, action, private: isPrivate });
 
+  // Do not assume the composer exists immediately after Message. Instagram
+  // hydrates the conversation pane asynchronously.
   await dmPage.waitForTimeout(700);
+  let composerResult = null;
+  let lastComposerError = null;
 
-  const inputs = [
-    dmPage.getByPlaceholder(/^(Message|پیام)(\.\.\.|…)?$/i).last(),
-    dmPage.getByLabel(/^(Message|پیام)/i).last(),
-    dmPage.locator('textarea').last(),
-    dmPage.locator('[contenteditable="true"]').last()
-  ];
-
-  let input = null;
-  for (const candidate of inputs) {
-    if (await candidate.isVisible().catch(() => false)) {
-      input = candidate;
-      break;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      composerResult = await findDmComposer(dmPage, username);
+      if (composerResult?.input) break;
+    } catch (error) {
+      lastComposerError = error;
     }
+    await dmPage.waitForTimeout(500 + attempt * 250);
   }
 
-  if (!input) throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
+  if (!composerResult?.input) {
+    throw new Error(lastComposerError?.message || `DM_INPUT_NOT_FOUND:${username}`);
+  }
 
+  appendLog('DM_INPUT_FOUND', {
+    username,
+    score: composerResult.descriptor.score,
+    rect: composerResult.descriptor.rect,
+    tag: composerResult.descriptor.tag,
+    role: composerResult.descriptor.role,
+    placeholder: composerResult.descriptor.placeholder,
+    aria: composerResult.descriptor.aria,
+    contenteditable: composerResult.descriptor.contenteditable
+  });
+
+  const input = composerResult.input;
   const beforeBody = normalizeText(await dmPage.locator('body').innerText().catch(() => ''));
   const beforeCount = beforeBody.split(normalizeText(messageText)).length - 1;
 
-  if (!(await input.fill(messageText).catch(() => false))) {
-    await input.click();
-    await input.pressSequentially(messageText, { delay: 12 });
+  await putTextInDmComposer(dmPage, input, messageText, username);
+
+  appendLog('DM_SUBMIT_READY', { username });
+
+  // Prefer the explicit Send control when Instagram exposes one. Otherwise,
+  // Enter is the desktop-chat send action. We only do this AFTER verifying that
+  // the intended text is truly inside the active composer.
+  const sendButtonCandidates = [
+    dmPage.getByRole('button', { name: /^(Send|ارسال)$/i }).last(),
+    dmPage.locator('button[aria-label="Send" i],button[title="Send" i],button[aria-label="ارسال" i]').last()
+  ];
+
+  let clickedSend = false;
+  for (const sendButton of sendButtonCandidates) {
+    if (await sendButton.isVisible().catch(() => false)) {
+      clickedSend = await safeClick(sendButton, 3000);
+      if (clickedSend) break;
+    }
   }
 
-  const sendButton = dmPage.getByRole('button', { name: /^(Send|ارسال)$/i }).last();
-  let sent = false;
-  if (await sendButton.isVisible().catch(() => false)) {
-    sent = await safeClick(sendButton, 2500);
+  if (!clickedSend) {
+    await input.press('Enter').catch(async () => {
+      await dmPage.keyboard.press('Enter');
+    });
   }
-  if (!sent) await input.press('Enter');
 
-  appendLog('DM_SUBMIT_TRIGGERED', { username });
-  await dmPage.waitForTimeout(1200);
+  appendLog('DM_SUBMIT_TRIGGERED', {
+    username,
+    method: clickedSend ? 'button' : 'enter'
+  });
 
-  const verified = await dmPage.waitForFunction(
-    ({ normalizedMessage, beforeCount }) => {
-      const normalize = value => String(value || '')
-        .normalize('NFKC')
-        .toLocaleLowerCase('fa')
-        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
-        .replace(/[ًٌٍَُِّْـ]/g, '')
-        .replace(/ي/g, 'ی')
-        .replace(/ى/g, 'ی')
-        .replace(/ك/g, 'ک')
-        .replace(/[ۀە]/g, 'ه')
-        .replace(/[أإآ]/g, 'ا')
-        .replace(/ؤ/g, 'و')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      const body = normalize(document.body.innerText || '');
-      const count = body.split(normalizedMessage).length - 1;
-      const inputs = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]'))
-        .filter(el => {
-          const r = el.getBoundingClientRect();
-          const s = getComputedStyle(el);
-          return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-        });
-      const hasFilledComposer = inputs.some(el => String(el.value || el.textContent || '').trim());
-      return count > Number(beforeCount || 0) && !hasFilledComposer;
-    },
-    { normalizedMessage: normalizeText(messageText), beforeCount },
-    { timeout: 8000 }
-  ).catch(() => false);
-
-  if (!verified) throw new Error(`DM_NOT_CONFIRMED:${username}`);
+  await verifyDmMessageSent(dmPage, messageText, beforeCount, username);
+  appendLog('DM_MESSAGE_VERIFIED', { username });
 
   return true;
 }

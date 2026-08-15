@@ -281,16 +281,76 @@ async function findCommentButton(page) {
   if (!candidates.length) return null;
 
   const viewport = page.viewportSize() || { width: 1440, height: 1000 };
+  const explicitMatch = candidates.find(c => {
+    const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
+    return /(^|\b)(comment|comments|نظر|دیدگاه|کامنت)(\b|$)/i.test(label);
+  });
+  if (explicitMatch) {
+    return { ...explicitMatch, strategy: 'explicit-label' };
+  }
+
+  const bands = new Map();
+  for (const c of candidates) {
+    const inActionBarZone = c.rect.top > 180 && c.rect.top < viewport.height - 60;
+    if (!inActionBarZone) continue;
+    const bandKey = Math.round(c.rect.top / 26);
+    const arr = bands.get(bandKey) || [];
+    arr.push(c);
+    bands.set(bandKey, arr);
+  }
+
+  const scoredBands = Array.from(bands.entries())
+    .map(([bandKey, items]) => {
+      const unique = items
+        .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top)
+        .filter((item, index, array) => index === 0 || Math.abs(item.rect.left - array[index - 1].rect.left) > 4);
+
+      const widthSum = unique.reduce((sum, c) => sum + c.rect.width, 0);
+      const svgSum = unique.reduce((sum, c) => sum + c.svgCount, 0);
+      const hrefPenalty = unique.reduce((sum, c) => sum + (c.href ? 1 : 0), 0);
+      const buttonLikeCount = unique.filter(c => c.buttonLike).length;
+      const tinyIconCount = unique.filter(c => c.rect.width <= 90 && c.rect.height <= 90).length;
+
+      const score =
+        unique.length * 18 +
+        buttonLikeCount * 8 +
+        svgSum * 5 +
+        tinyIconCount * 6 -
+        hrefPenalty * 10 -
+        Math.max(0, Math.floor(widthSum / 250));
+
+      return { bandKey, items: unique, score };
+    })
+    .filter(x => x.items.length >= 2)
+    .sort((a, b) => b.score - a.score || a.bandKey - b.bandKey);
+
+  if (scoredBands.length) {
+    const bestBand = scoredBands[0];
+    const ordered = bestBand.items.slice().sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
+    const byHeuristic = ordered.find(c => {
+      const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
+      return /comment|comments|نظر|دیدگاه|کامنت/i.test(label);
+    });
+    if (byHeuristic) {
+      return { ...byHeuristic, strategy: 'band-explicit' };
+    }
+
+    const preferredIndex = ordered.length >= 2 ? 1 : 0;
+    const preferred = ordered[preferredIndex] || ordered[0];
+    if (preferred) {
+      return { ...preferred, strategy: ordered.length >= 2 ? 'band-second-button' : 'band-first-button' };
+    }
+  }
+
   let best = null;
   for (const c of candidates) {
     const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
-    const isComment = /(^|\b)(comment|comments|نظر|دیدگاه|کامنت)(\b|$)/i.test(label);
     const looksLikeActionBar = c.rect.top > 200 && c.rect.top < viewport.height - 70 && c.rect.left > viewport.width * 0.25;
     const nearLikeBar = c.rect.width <= 90 && c.rect.height <= 90;
     const score = [
-      isComment ? 100 : 0,
       /comment/i.test(c.aria) ? 40 : 0,
       /comment/i.test(c.title) ? 25 : 0,
+      /comment/i.test(label) ? 20 : 0,
       c.svgCount > 0 ? 8 : 0,
       looksLikeActionBar ? 12 : 0,
       nearLikeBar ? 8 : 0,
@@ -300,11 +360,11 @@ async function findCommentButton(page) {
     ].reduce((a, b) => a + b, 0);
 
     if (!best || score > best.score) {
-      best = { ...c, score, strategy: isComment ? 'explicit-label' : 'heuristic' };
+      best = { ...c, score, strategy: 'heuristic' };
     }
   }
 
-  if (!best || best.score < 40) return null;
+  if (!best || best.score < 22) return null;
   return best;
 }
 
@@ -312,20 +372,17 @@ async function clickRealCommentButton(page) {
   const found = await findCommentButton(page);
   if (!found) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
 
-  const clicked = await page.evaluate(({ index }) => {
+  const handle = await page.evaluateHandle(({ index }) => {
     const nodes = Array.from(document.querySelectorAll('button,[role="button"],a'));
-    const el = nodes[index];
-    if (!el) return false;
-    el.setAttribute('data-ig-comment-button', '1');
-    return true;
+    return nodes[index] || null;
   }, { index: found.index });
 
-  if (!clicked) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  const button = handle.asElement();
+  if (!button) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
 
-  const button = page.locator('[data-ig-comment-button="1"]').first();
   await button.scrollIntoViewIfNeeded().catch(() => {});
   await button.click({ timeout: CLICK_TIMEOUT_MS });
-  await page.evaluate(() => document.querySelectorAll('[data-ig-comment-button="1"]').forEach(el => el.removeAttribute('data-ig-comment-button'))).catch(() => {});
+  await handle.dispose().catch(() => {});
   return found;
 }
 
@@ -674,6 +731,45 @@ async function saveCommentsScreenshot(root, postLog) {
   appendLog('COMMENTS_SCREENSHOT_SAVED', { url: postLog.url, screenshot: screenshotPath });
 }
 
+async function saveFailureScreenshot(page, postLog, stage, error) {
+  const safeStage = String(stage || 'error')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '') || 'error';
+
+  const screenshotPath = path.join(
+    ARTIFACTS,
+    `last-stop-post-${String(postLog.postIndex || 0).padStart(2, '0')}-${safeStage}.png`
+  );
+
+  try {
+    if (page && !page.isClosed()) {
+      await page.screenshot({ path: screenshotPath, fullPage: false });
+      postLog.failureScreenshot = screenshotPath;
+      postLog.failureStage = stage;
+      postLog.failureError = String(error?.message || error);
+      appendLog('FAILURE_SCREENSHOT_SAVED', {
+        url: postLog.url,
+        postIndex: postLog.postIndex,
+        stage,
+        screenshot: screenshotPath,
+        error: String(error?.message || error)
+      });
+      return screenshotPath;
+    }
+  } catch (screenshotError) {
+    appendLog('FAILURE_SCREENSHOT_FAILED', {
+      url: postLog.url,
+      postIndex: postLog.postIndex,
+      stage,
+      error: String(screenshotError?.message || screenshotError)
+    });
+  }
+
+  return null;
+}
+
 async function findCommentRow(root, target, page) {
   for (let attempt = 0; attempt < 40; attempt++) {
     const handle = await root.evaluateHandle((rootEl, targetComment) => {
@@ -905,6 +1001,9 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
     url,
     startedAt: now(),
     screenshot: null,
+    failureScreenshot: null,
+    failureStage: null,
+    failureError: null,
     commentClickStrategy: null,
     commentsScanned: 0,
     matchesFound: 0,
@@ -915,95 +1014,111 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
   };
 
   appendLog('OPEN_POST', { url, postIndex });
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForTimeout(1500);
-  await dismissCommonPopups(page);
 
-  const clickInfo = await clickRealCommentButton(page);
-  postLog.commentClickStrategy = clickInfo.strategy;
-  appendLog('COMMENT_BUTTON_FOUND', { url, strategy: clickInfo.strategy });
-  appendLog('COMMENT_BUTTON_CLICKED', { url, strategy: clickInfo.strategy });
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(1500);
+    await dismissCommonPopups(page);
 
-  const descriptor = await waitForCommentRoot(page);
-  if (!descriptor) throw new Error('COMMENT_UI_DID_NOT_OPEN');
-  if (!descriptor.rowCount || descriptor.rowCount < 1) throw new Error('COMMENT_ROOT_NOT_FOUND');
+    const clickInfo = await clickRealCommentButton(page);
+    postLog.commentClickStrategy = clickInfo.strategy;
+    appendLog('COMMENT_BUTTON_FOUND', { url, strategy: clickInfo.strategy });
+    appendLog('COMMENT_BUTTON_CLICKED', { url, strategy: clickInfo.strategy });
 
-  await markCommentRoot(page, descriptor);
-  const root = await getRootLocator(page);
+    const descriptor = await waitForCommentRoot(page);
+    if (!descriptor) throw new Error('COMMENT_UI_DID_NOT_OPEN');
+    if (!descriptor.rowCount || descriptor.rowCount < 1) throw new Error('COMMENT_ROOT_NOT_FOUND');
 
-  await saveCommentsScreenshot(root, postLog);
+    await markCommentRoot(page, descriptor);
+    const root = await getRootLocator(page);
 
-  const comments = await scanCommentList(page, root, postLog);
-  if (!comments.length) {
-    throw new Error('REAL_COMMENT_LIST_OPENED_BUT_ZERO_COMMENTS_FOUND');
-  }
+    await saveCommentsScreenshot(root, postLog);
 
-  appendLog('COMMENT_SCAN_COMPLETE', { url, commentsScanned: comments.length, scanRounds: postLog.scanRounds });
-
-  const processed = new Set();
-  const matches = [];
-
-  for (const comment of comments) {
-    const match = keywordMatch(comment.commentText, keywords);
-    if (!match.matched) continue;
-    const key = `${comment.profilePath}|${compactText(comment.commentText)}|${match.keyword}`;
-    if (processed.has(key)) continue;
-    processed.add(key);
-    matches.push({ comment, match });
-  }
-
-  postLog.matchesFound = matches.length;
-  appendLog('MATCH_FOUND', { url, matchesFound: matches.length });
-
-  for (const { comment, match } of matches) {
-    const item = {
-      username: comment.username,
-      profile: comment.profilePath,
-      comment: comment.commentText,
-      keyword: match.keyword,
-      mode: match.mode,
-      distance: match.distance,
-      reply: 'pending',
-      dm: 'pending',
-      status: 'pending'
-    };
-
-    appendLog('MATCH_FOUND', { url, username: comment.username, keyword: match.keyword, matchMode: match.mode, distance: match.distance });
-
-    try {
-      const row = await findCommentRow(root, comment, page);
-      await sendReply(page, row, commentReply);
-      item.reply = 'sent';
-      appendLog('REPLY_SENT', { url, username: comment.username, keyword: match.keyword });
-
-      await sendDM(dmPage, comment.profilePath, comment.username, dmReply);
-      item.dm = 'sent';
-      item.status = 'done';
-      postLog.matchesCompleted++;
-      appendLog('DM_SENT', { url, username: comment.username });
-      appendLog('MATCH_COMPLETED', { url, username: comment.username, keyword: match.keyword });
-    } catch (error) {
-      item.status = 'error';
-      item.error = String(error?.message || error);
-      postLog.matchesFailed++;
-      appendLog('MATCH_FAILED', { url, username: comment.username, comment: comment.commentText, error: item.error });
+    const comments = await scanCommentList(page, root, postLog);
+    if (!comments.length) {
+      throw new Error('REAL_COMMENT_LIST_OPENED_BUT_ZERO_COMMENTS_FOUND');
     }
 
-    postLog.matchItems.push(item);
+    appendLog('COMMENT_SCAN_COMPLETE', { url, commentsScanned: comments.length, scanRounds: postLog.scanRounds });
+
+    const processed = new Set();
+    const matches = [];
+
+    for (const comment of comments) {
+      const match = keywordMatch(comment.commentText, keywords);
+      if (!match.matched) continue;
+      const key = `${comment.profilePath}|${compactText(comment.commentText)}|${match.keyword}`;
+      if (processed.has(key)) continue;
+      processed.add(key);
+      matches.push({ comment, match });
+    }
+
+    postLog.matchesFound = matches.length;
+    appendLog('MATCH_FOUND', { url, matchesFound: matches.length });
+
+    for (const { comment, match } of matches) {
+      const item = {
+        username: comment.username,
+        profile: comment.profilePath,
+        comment: comment.commentText,
+        keyword: match.keyword,
+        mode: match.mode,
+        distance: match.distance,
+        reply: 'pending',
+        dm: 'pending',
+        status: 'pending'
+      };
+
+      appendLog('MATCH_FOUND', { url, username: comment.username, keyword: match.keyword, matchMode: match.mode, distance: match.distance });
+
+      try {
+        const row = await findCommentRow(root, comment, page);
+        await sendReply(page, row, commentReply);
+        item.reply = 'sent';
+        appendLog('REPLY_SENT', { url, username: comment.username, keyword: match.keyword });
+
+        await sendDM(dmPage, comment.profilePath, comment.username, dmReply);
+        item.dm = 'sent';
+        item.status = 'done';
+        postLog.matchesCompleted++;
+        appendLog('DM_SENT', { url, username: comment.username });
+        appendLog('MATCH_COMPLETED', { url, username: comment.username, keyword: match.keyword });
+      } catch (error) {
+        item.status = 'error';
+        item.error = String(error?.message || error);
+        postLog.matchesFailed++;
+        appendLog('MATCH_FAILED', { url, username: comment.username, comment: comment.commentText, error: item.error });
+      }
+
+      postLog.matchItems.push(item);
+    }
+
+    postLog.commentsScanned = comments.length;
+    postLog.finishedAt = now();
+    appendLog('POST_FINISHED', {
+      url,
+      commentsScanned: postLog.commentsScanned,
+      matchesFound: postLog.matchesFound,
+      matchesCompleted: postLog.matchesCompleted,
+      matchesFailed: postLog.matchesFailed,
+      screenshot: postLog.screenshot,
+      failureScreenshot: postLog.failureScreenshot
+    });
+
+    return postLog;
+  } catch (error) {
+    postLog.finishedAt = now();
+    postLog.failureError = String(error?.message || error);
+    const stage = postLog.screenshot ? 'after-comments-screenshot' : 'post-error';
+    await saveFailureScreenshot(page, postLog, stage, error);
+    appendLog('POST_ERROR', {
+      url,
+      error: String(error?.message || error),
+      failureScreenshot: postLog.failureScreenshot,
+      failureStage: postLog.failureStage
+    });
+    throw error;
   }
-
-  postLog.commentsScanned = comments.length;
-  postLog.finishedAt = now();
-  appendLog('POST_FINISHED', {
-    url,
-    commentsScanned: postLog.commentsScanned,
-    matchesFound: postLog.matchesFound,
-    matchesCompleted: postLog.matchesCompleted,
-    matchesFailed: postLog.matchesFailed,
-    screenshot: postLog.screenshot
-  });
-
-  return postLog;
 }
 
 async function main() {

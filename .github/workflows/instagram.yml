@@ -1,0 +1,48 @@
+name: Instagram automation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      INSTAGRAM_POST_URLS: ${{ secrets.INSTAGRAM_POST_URLS }}
+      INSTAGRAM_KEYWORDS: ${{ secrets.INSTAGRAM_KEYWORDS }}
+      INSTAGRAM_COMMENT_REPLY: ${{ secrets.INSTAGRAM_COMMENT_REPLY }}
+      INSTAGRAM_DM_REPLY: ${{ secrets.INSTAGRAM_DM_REPLY }}
+      INSTAGRAM_SESSION_B64: ${{ secrets.INSTAGRAM_SESSION_B64 }}
+      INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
+      INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
+      INSTAGRAM_HEADLESS: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Instagram engine
+        run: npm run run
+
+      - name: Upload run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instagram-run-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: ignore
+          retention-days: 14

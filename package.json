@@ -1,0 +1,13 @@
+{
+  "name": "instagram-github-action-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node src/index.mjs",
+    "auth": "node scripts/create-auth-state.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.0"
+  }
+}

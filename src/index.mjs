@@ -951,16 +951,28 @@ async function saveFailureScreenshot(page, postLog, stage, error) {
 }
 
 async function findCommentRow(root, target, page) {
-  const targetUsername = normalizeText(target?.username || '');
-  const targetCommentText = normalizeText(target?.commentText || '');
+  const targetUsername = String(target?.username || '').trim();
+  const targetComment = String(target?.commentText || '').trim();
   const targetProfilePath = String(target?.profilePath || '').trim();
 
-  if (!targetUsername || !targetCommentText) {
+  if (!targetUsername || !targetComment) {
     throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
   }
 
-  const findInCurrentDom = async () => {
-    const handle = await root.evaluateHandle((rootEl, targetData) => {
+  await page.waitForTimeout(250);
+
+  // The scanner leaves the virtualized list at the end. Rewind first so an
+  // early match can be rebound to a real DOM row instead of relying on the
+  // initial viewport.
+  await root.evaluate(el => {
+    el.scrollTop = 0;
+  }).catch(() => {});
+  await page.waitForTimeout(350);
+
+  const maxAttempts = Math.max(24, Math.min(MAX_SCAN_ROUNDS, 160));
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const descriptor = await root.evaluate((rootEl, targetComment) => {
       const normalize = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -975,274 +987,133 @@ async function findCommentRow(root, target, page) {
         .replace(/\s+/g, ' ')
         .trim();
 
-      const compact = value => normalize(value).replace(/\s+/g, '');
+      const targetUsername = normalize(targetComment.username);
+      const targetCommentText = normalize(targetComment.commentText);
+      const targetProfilePath = String(targetComment.profilePath || '').trim();
 
-      const validProfileHref = href => {
-        const value = String(href || '');
-        if (!/^\/[^/]+\/?$/.test(value)) return false;
-        return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(value);
+      const validHref = href => {
+        const v = String(href || '');
+        if (!/^\/[^/]+\/?$/.test(v)) return false;
+        return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(v);
       };
 
-      const isVisible = element => {
-        if (!element) return false;
-        const rect = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
+      const visible = el => {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
         return (
-          style.display !== 'none' &&
-          style.visibility !== 'hidden' &&
-          rect.width > 0 &&
-          rect.height > 0 &&
-          rect.right > 0 &&
-          rect.bottom > 0 &&
-          rect.left < innerWidth &&
-          rect.top < innerHeight
+          s.display !== 'none' &&
+          s.visibility !== 'hidden' &&
+          r.width > 0 &&
+          r.height > 0 &&
+          r.bottom > 0 &&
+          r.right > 0 &&
+          r.top < innerHeight &&
+          r.left < innerWidth
         );
       };
 
-      const hasTimestampSignal = element => {
-        if (element.querySelector('time')) return true;
+      const hasTime = el => !!el.querySelector('time') || /(?:\b\d+\s*[smhdwmy]\b|\b\d+\s*(ثانیه|دقیقه|ساعت|روز|هفته|ماه|سال))/.test(normalize(el.innerText || ''));
 
-        const lines = String(element.innerText || '')
-          .split(/\n+/)
-          .map(line => normalize(line))
-          .filter(Boolean);
+      const isGlobalNoise = text => /^(add a comment|view insights|boost post|send message|message|send|post|cancel|close|ok|got it|reply|like|likes|پاسخ|نظر)$/i.test(normalize(text));
 
-        return lines.some(line =>
-          /^\d+\s*(s|m|h|d|w|mo|y)$/i.test(line) ||
-          /^\d+\s*(ثانیه|دقیقه|ساعت|روز|هفته|ماه|سال)$/i.test(line) ||
-          /^\d{1,2}:\d{2}$/.test(line)
-        );
-      };
-
-      const isUiOnlyText = value => {
-        const line = normalize(value);
-        return (
-          /^(reply|پاسخ|like|likes?|پسندیدن|send|ارسال|post|پست)$/i.test(line) ||
-          /^view all \d+ replies$/i.test(line) ||
-          /^view hidden comments$/i.test(line) ||
-          /^add a comment$/i.test(line)
-        );
-      };
-
-      const scoreCandidate = (element, profileLink) => {
-        if (!isVisible(element)) return null;
-
-        const text = String(element.innerText || '').trim();
-        const normalizedText = normalize(text);
-
-        if (!normalizedText) return null;
-        if (text.length > 900) return null;
-
-        const profileLinks = Array.from(element.querySelectorAll('a[href^="/"]'))
-          .filter(a => validProfileHref(a.getAttribute('href')));
-
-        if (profileLinks.length !== 1) return null;
-
-        const actualProfilePath = profileLinks[0].getAttribute('href') || '';
-        if (targetData.profilePath && actualProfilePath !== targetData.profilePath) return null;
-
-        if (profileLink && profileLinks[0] !== profileLink) return null;
-
-        if (!normalizedText.includes(targetData.username)) return null;
-        if (
-          !normalizedText.includes(targetData.commentText) &&
-          !compact(normalizedText).includes(compact(targetData.commentText))
-        ) {
-          return null;
-        }
-
-        const lines = text
-          .split(/\n+/)
-          .map(line => line.trim())
-          .filter(Boolean);
-
-        if (lines.length < 2 || lines.length > 15) return null;
-        if (!hasTimestampSignal(element)) return null;
-
-        const rect = element.getBoundingClientRect();
-        const sizeScore = Math.max(
-          0,
-          70 - Math.min(70, Math.floor((rect.width * rect.height) / 6000))
-        );
-
-        let score = 180;
-        score += element.querySelector('time') ? 45 : 0;
-        score += Array.from(
-          element.querySelectorAll('button,[role="button"],a')
-        ).some(node => {
-          const label = normalize(
-            `${node.innerText || ''} ${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''}`
-          );
-          return /^(reply|پاسخ)$/i.test(label) || /^reply\b/i.test(label);
-        }) ? 35 : 0;
-        score += sizeScore;
-
-        if (isUiOnlyText(text)) score -= 60;
-
-        return {
-          element,
-          score,
-          textLength: text.length,
-          rect,
-          profilePath: actualProfilePath
-        };
+      const rowLike = el => {
+        if (!visible(el)) return false;
+        const text = String(el.innerText || '').trim();
+        if (!text || text.length > 900) return false;
+        const links = Array.from(el.querySelectorAll('a[href^="/"]')).filter(a => validHref(a.getAttribute('href')));
+        if (links.length !== 1) return false;
+        if (!hasTime(el)) return false;
+        const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+        if (lines.length < 2 || lines.length > 15) return false;
+        if (isGlobalNoise(text)) return false;
+        return true;
       };
 
       const candidates = [];
+      const profileLinks = Array.from(rootEl.querySelectorAll('a[href^="/"]'))
+        .filter(a => validHref(a.getAttribute('href')))
+        .filter(a => normalize(a.textContent || '') === targetUsername)
+        .filter(a => !targetProfilePath || (a.getAttribute('href') || '') === targetProfilePath);
 
-      /*
-       * Primary path:
-       * Find the exact username/profile link and walk upward. The first
-       * ancestor accepted as a row must remain a small, single-profile,
-       * timestamp-bearing subtree containing the exact comment text.
-       */
-      const profileLinks = Array.from(
-        rootEl.querySelectorAll('a[href^="/"]')
-      )
-        .filter(a => validProfileHref(a.getAttribute('href')))
-        .filter(a => normalize(a.textContent || '') === targetData.username)
-        .filter(a => !targetData.profilePath || (a.getAttribute('href') || '') === targetData.profilePath);
-
-      for (const profileLink of profileLinks) {
-        let node = profileLink;
-
-        for (let depth = 0; depth < 10 && node && node !== rootEl; depth += 1) {
+      for (const link of profileLinks) {
+        let node = link;
+        for (let depth = 0; depth < 12 && node && node !== rootEl; depth += 1) {
           node = node.parentElement;
-          if (!node) break;
+          if (!node || !rowLike(node)) continue;
+          const links = Array.from(node.querySelectorAll('a[href^="/"]')).filter(a => validHref(a.getAttribute('href')));
+          if (links.length !== 1) continue;
+          const text = normalize(node.innerText || '');
+          if (!text.includes(targetUsername) || !text.includes(targetCommentText)) continue;
+          if (targetProfilePath && (links[0].getAttribute('href') || '') !== targetProfilePath) continue;
 
-          const candidate = scoreCandidate(node, profileLink);
-          if (!candidate) continue;
-
-          candidates.push(candidate);
+          const rect = node.getBoundingClientRect();
+          const score =
+            300 - depth * 12 +
+            (node.querySelector('time') ? 35 : 0) +
+            (/\bReply\b|پاسخ/i.test(text) ? 20 : 0) -
+            Math.max(0, text.length - 420) / 18;
+          candidates.push({ node, score, rect });
           break;
         }
       }
 
-      /*
-       * Structural fallback:
-       * Used only when the profile-link path is temporarily unavailable.
-       * Large comment containers are explicitly rejected by the same
-       * single-profile + timestamp + small-subtree constraints.
-       */
-      if (!candidates.length) {
-        const structural = Array.from(
-          rootEl.querySelectorAll('article,li,[role="article"],[data-testid],div')
-        )
-          .map(element => scoreCandidate(element, null))
-          .filter(Boolean)
-          .sort((a, b) =>
-            b.score - a.score ||
-            a.textLength - b.textLength ||
-            a.rect.top - b.rect.top
-          );
-
-        candidates.push(...structural.slice(0, 5));
-      }
-
       if (!candidates.length) return null;
 
-      candidates.sort((a, b) =>
-        b.score - a.score ||
-        a.textLength - b.textLength ||
-        a.rect.top - b.rect.top
-      );
+      candidates.sort((a, b) => {
+        const aArea = a.rect.width * a.rect.height;
+        const bArea = b.rect.width * b.rect.height;
+        return b.score - a.score || aArea - bArea || a.rect.top - b.rect.top;
+      });
 
-      const best = candidates[0];
-      const token = `comment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      best.element.setAttribute('data-ig-target-row', token);
+      // Mark this exact row with a unique token. No "last()" selector is used.
+      const row = candidates[0].node;
+      const token = `ig-row-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      row.setAttribute('data-ig-target-row', token);
 
       return {
         token,
-        profilePath: best.profilePath
+        top: candidates[0].rect.top,
+        left: candidates[0].rect.left,
+        width: candidates[0].rect.width,
+        height: candidates[0].rect.height
       };
     }, {
       username: targetUsername,
-      commentText: targetCommentText,
+      commentText: targetComment,
       profilePath: targetProfilePath
-    });
+    }).catch(() => null);
 
-    const descriptor = await handle.jsonValue().catch(() => null);
-    await handle.dispose().catch(() => {});
-
-    if (!descriptor?.token) return null;
-
-    const safeToken = String(descriptor.token).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const row = page.locator(
-      `[data-ig-target-row="${safeToken}"]`
-    ).first();
-
-    if (!(await row.isVisible().catch(() => false))) return null;
-
-    await row.scrollIntoViewIfNeeded().catch(() => {});
-    await page.waitForTimeout(200);
-
-    return row;
-  };
-
-  /*
-   * Scan again from the top because the normal comment scanner intentionally
-   * finishes at the bottom and Instagram may virtualize rows that are no
-   * longer in the DOM. This keeps the existing scan workflow untouched while
-   * making match->row binding independent of the final scroll position.
-   */
-  await root.evaluate(el => {
-    el.scrollTop = 0;
-  }).catch(() => {});
-
-  await page.waitForTimeout(250);
-
-  for (let round = 1; round <= MAX_SCAN_ROUNDS; round += 1) {
-    const row = await findInCurrentDom();
-    if (row) return row;
-
-    const moreClicked = await clickMoreComments(root);
-    if (moreClicked) {
-      await page.waitForTimeout(450);
-      const afterMore = await findInCurrentDom();
-      if (afterMore) return afterMore;
+    if (descriptor?.token) {
+      const selector = `[data-ig-target-row="${String(descriptor.token).replace(/"/g, '\\"')}"]`;
+      const row = page.locator(selector).first();
+      if (await row.isVisible().catch(() => false)) {
+        await row.scrollIntoViewIfNeeded().catch(() => {});
+        await page.waitForTimeout(250);
+        return row;
+      }
     }
 
-    const scroll = await scrollRoot(root, SCROLL_STEP);
-    await page.waitForTimeout(Math.min(SCROLL_WAIT, 650));
+    const state = await scrollRoot(root, SCROLL_STEP);
+    await page.waitForTimeout(Math.max(350, Math.min(SCROLL_WAIT, 900)));
 
-    if (scroll.atBottom) {
-      const finalAttempt = await findInCurrentDom();
-      if (finalAttempt) return finalAttempt;
-
-      break;
+    if (state.atBottom) {
+      // One extra pass after reaching bottom catches DOM rehydration/virtualized
+      // comment rows that appear one tick later.
+      await page.waitForTimeout(450);
+      const retryState = await scrollRoot(root, 1);
+      if (retryState.after === retryState.max && attempt > 2) break;
     }
   }
-
-  /*
-   * One last top-position attempt handles a DOM recycle race where the target
-   * appeared only briefly between scroll cycles.
-   */
-  await root.evaluate(el => {
-    el.scrollTop = 0;
-  }).catch(() => {});
-  await page.waitForTimeout(250);
-
-  const finalRow = await findInCurrentDom();
-  if (finalRow) return finalRow;
 
   throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 }
 
 
-async function sendReply(page, row, replyText) {
-  if (!row) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
+async function locateReplyControl(page, row, username) {
+  const token = await row.getAttribute('data-ig-target-row');
+  if (!token) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 
-  const reply = String(replyText || '').trim();
-  if (!reply) throw new Error('REPLY_NOT_CONFIRMED');
-
-  await row.scrollIntoViewIfNeeded().catch(() => {});
-  await page.waitForTimeout(250);
-
-  /*
-   * Reply control is strictly row-scoped. The only fallback allowed is the
-   * nearest logical comment-thread ancestor with exactly one profile link.
-   * There is intentionally NO document-wide Reply search.
-   */
   const replyDescriptor = await row.evaluate(rowEl => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
@@ -1258,173 +1129,154 @@ async function sendReply(page, row, replyText) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    const isVisible = element => {
-      if (!element) return false;
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
       return (
-        style.display !== 'none' &&
-        style.visibility !== 'hidden' &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        rect.right > 0 &&
-        rect.bottom > 0 &&
-        rect.left < innerWidth &&
-        rect.top < innerHeight
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.right > 0 &&
+        r.bottom > 0 &&
+        r.left < innerWidth &&
+        r.top < innerHeight
       );
     };
 
-    const getLabel = element => normalize(
-      `${element.innerText || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`
+    const label = el => normalize(
+      `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`
     );
-
-    const isReplyControl = element => {
-      if (!isVisible(element)) return false;
-      if (!element.matches('button,[role="button"],a')) return false;
-
-      const label = getLabel(element);
-
-      return (
-        /^(reply|پاسخ)$/i.test(label) ||
-        /^reply\b/i.test(label) ||
-        /^پاسخ\b/i.test(label)
-      );
-    };
-
-    const profileCount = element => Array.from(
-      element.querySelectorAll('a[href^="/"]')
-    ).filter(a => {
-      const href = String(a.getAttribute('href') || '');
-      return (
-        /^\/[^/]+\/?$/.test(href) &&
-        !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href)
-      );
-    }).length;
 
     const rowRect = rowEl.getBoundingClientRect();
     const candidates = [];
 
-    const collect = (scope, source) => {
-      if (!scope) return;
+    // Instagram renders Reply as a small text control. Prefer the smallest
+    // visible exact-text node instead of a large wrapper that contains Reply.
+    const elements = Array.from(rowEl.querySelectorAll('a,button,[role="button"],span,div'));
+    for (const el of elements) {
+      if (!visible(el)) continue;
+      const own = normalize(el.textContent || '');
+      const full = label(el);
+      if (!(own === 'reply' || own === 'پاسخ' || full === 'reply' || full === 'پاسخ')) continue;
 
-      const scopeRect = scope.getBoundingClientRect();
+      const childReply = Array.from(el.children).some(child => {
+        const c = normalize(child.textContent || '');
+        return c === 'reply' || c === 'پاسخ';
+      });
+      if (childReply) continue;
 
-      for (const control of Array.from(
-        scope.querySelectorAll('button,[role="button"],a')
-      )) {
-        if (!isReplyControl(control)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.top < rowRect.top) continue;
+      if (r.top > rowRect.bottom + 100) continue;
 
-        const rect = control.getBoundingClientRect();
+      let score = 300;
+      if (el.tagName === 'BUTTON' || el.getAttribute('role') === 'button') score += 45;
+      if (r.top >= rowRect.bottom - 25) score += 55;
+      score -= Math.abs(r.left - rowRect.left) * 0.25;
+      score -= Math.abs(r.top - (rowRect.bottom - 2)) * 0.7;
 
-        if (rect.bottom < rowRect.top - 20) continue;
-        if (rect.top > rowRect.bottom + 120) continue;
-        if (rect.right < scopeRect.left || rect.left > scopeRect.right) continue;
+      candidates.push({ el, score, rect: r });
+    }
 
-        const verticalDistance = Math.abs(
-          rect.top - (rowRect.bottom - Math.min(12, rowRect.height * 0.1))
-        );
-
-        let score = source === 'row' ? 200 : 130;
-        score += Math.max(0, 70 - verticalDistance);
-        score += control.matches('button,[role="button"]') ? 25 : 0;
-        score += /^(reply|پاسخ)$/i.test(getLabel(control)) ? 30 : 0;
-
-        candidates.push({
-          control,
-          score,
-          source,
-          rect
-        });
-      }
-    };
-
-    collect(rowEl, 'row');
-
+    // Small fallback: scan immediate row siblings/ancestors only, never page-wide.
     let scope = rowEl.parentElement;
-    for (let depth = 0; depth < 3 && scope; depth += 1) {
-      if (profileCount(scope) === 1) {
-        const rect = scope.getBoundingClientRect();
-        if (rect.width <= 1200 && rect.height <= 900) {
-          collect(scope, 'ancestor');
-        }
+    for (let depth = 0; depth < 2 && scope; depth += 1) {
+      for (const el of Array.from(scope.querySelectorAll('a,button,[role="button"],span,div'))) {
+        if (!visible(el)) continue;
+        const own = normalize(el.textContent || '');
+        const full = label(el);
+        if (!(own === 'reply' || own === 'پاسخ' || full === 'reply' || full === 'پاسخ')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.top < rowRect.top || r.top > rowRect.bottom + 100) continue;
+        const siblingProfileLinks = Array.from(scope.querySelectorAll('a[href^="/"]')).filter(a => {
+          const href = a.getAttribute('href') || '';
+          return /^\/[^/]+\/?$/.test(href) && !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href);
+        });
+        if (siblingProfileLinks.length !== 1) continue;
+        candidates.push({ el, score: 220 - depth * 30, rect: r });
       }
-
       scope = scope.parentElement;
     }
 
     if (!candidates.length) return null;
+    candidates.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top);
 
-    candidates.sort((a, b) =>
-      b.score - a.score ||
-      a.rect.top - b.rect.top ||
-      a.rect.left - b.rect.left
-    );
+    const token = `ig-reply-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    candidates[0].el.setAttribute('data-ig-reply-target', token);
+    return { token, rect: candidates[0].rect };
+  }).catch(() => null);
 
-    const best = candidates[0];
-    const token = `reply-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    best.control.setAttribute('data-ig-reply-target', token);
+  if (!replyDescriptor?.token) throw new Error('REPLY_BUTTON_NOT_FOUND');
 
-    return {
-      token,
-      source: best.source,
-      score: best.score
-    };
-  });
+  const selector = `[data-ig-reply-target="${String(replyDescriptor.token).replace(/"/g, '\\"')}"]`;
+  const locator = page.locator(selector).first();
+  if (!(await locator.isVisible().catch(() => false))) throw new Error('REPLY_BUTTON_NOT_FOUND');
 
-  if (!replyDescriptor?.token) {
-    throw new Error('REPLY_BUTTON_NOT_FOUND');
-  }
+  await locator.scrollIntoViewIfNeeded().catch(() => {});
+  return locator;
+}
 
-  const safeReplyToken = String(replyDescriptor.token)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"');
 
-  const replyLocator = page
-    .locator(`[data-ig-reply-target="${safeReplyToken}"]`)
-    .first();
+async function findReplyComposer(page, root, username) {
+  const usernameNorm = normalizeText(username).replace(/^@/, '');
+  const candidates = [
+    root.locator('textarea').last(),
+    root.locator('[contenteditable="true"]').last(),
+    page.locator('textarea').last(),
+    page.locator('[contenteditable="true"]').last()
+  ];
 
-  if (!(await replyLocator.isVisible().catch(() => false))) {
-    throw new Error('REPLY_BUTTON_NOT_FOUND');
-  }
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    for (const input of candidates) {
+      if (!(await input.isVisible().catch(() => false))) continue;
 
-  await replyLocator.scrollIntoViewIfNeeded().catch(() => {});
+      const meta = await input.evaluate(el => ({
+        value: String(el.value || ''),
+        text: String(el.textContent || ''),
+        placeholder: String(el.getAttribute('placeholder') || ''),
+        aria: String(el.getAttribute('aria-label') || ''),
+        nearbyText: String(el.closest('form,[role="dialog"]')?.innerText || el.parentElement?.innerText || '').slice(0, 500)
+      })).catch(() => null);
 
-  if (!(await safeClick(replyLocator, CLICK_TIMEOUT_MS))) {
-    await replyLocator.evaluate(element => {
-      if (element instanceof HTMLElement) {
-        element.click();
-        return;
-      }
+      if (!meta) continue;
 
-      element.dispatchEvent(new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        view: window
-      }));
-    }).catch(() => {});
-  }
+      const joined = normalizeText([
+        meta.value,
+        meta.text,
+        meta.placeholder,
+        meta.aria,
+        meta.nearbyText
+      ].join(' '));
 
-  /*
-   * Do not treat a successful DOM click as a successful Reply operation.
-   * We need a visible reply composer.
-   */
-  await page.waitForTimeout(450);
-
-  const composerDescriptor = await page.evaluate(() => {
-    const visible = element => {
-      if (!element) return false;
-      const rect = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return (
-        style.display !== 'none' &&
-        style.visibility !== 'hidden' &&
-        rect.width > 0 &&
-        rect.height > 0 &&
-        rect.right > 0 &&
-        rect.bottom > 0
+      const strongMentionSource = normalizeText(`${meta.value} ${meta.text} ${meta.placeholder} ${meta.aria}`);
+      const nearbySource = normalizeText(meta.nearbyText);
+      const hasUserMention = strongMentionSource.includes(`@${usernameNorm}`) || strongMentionSource.includes(usernameNorm);
+      const replySemantic = /replying to|پاسخ به/i.test(
+        normalizeText(`${meta.placeholder} ${meta.aria}`)
+      ) || (
+        nearbySource.length <= 500 &&
+        (nearbySource.includes(`@${usernameNorm}`) || /replying to|پاسخ به/i.test(nearbySource))
       );
-    };
 
+      // Critical safety gate: do not send anything unless Instagram has clearly
+      // switched the composer into the reply context. This prevents the exact
+      // failure where the text becomes a brand-new top-level comment.
+      if (hasUserMention || replySemantic) {
+        return { input, meta, hasUserMention, replySemantic };
+      }
+    }
+    await page.waitForTimeout(220);
+  }
+
+  throw new Error('REPLY_UI_NOT_OPENED');
+}
+
+
+async function getCommentThreadStats(root, targetUsername, targetComment) {
+  return root.evaluate(({ username, commentText }) => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
@@ -1439,239 +1291,444 @@ async function sendReply(page, row, replyText) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    const inputs = Array.from(
-      document.querySelectorAll('textarea,[contenteditable="true"]')
-    ).filter(visible);
+    const validHref = href => /^\/[^/]+\/?$/.test(String(href || '')) && !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(String(href || ''));
+    const user = normalize(username);
+    const comment = normalize(commentText);
+    const rows = [];
 
-    if (!inputs.length) return null;
+    for (const link of Array.from(rootEl.querySelectorAll('a[href^="/"]'))) {
+      if (!validHref(link.getAttribute('href'))) continue;
+      if (normalize(link.textContent || '') !== user) continue;
 
-    const active = document.activeElement;
-    const candidates = inputs.map((element, index) => {
-      const rect = element.getBoundingClientRect();
-      const placeholder = normalize(
-        `${element.getAttribute('placeholder') || ''} ${element.getAttribute('aria-label') || ''}`
-      );
+      let node = link;
+      for (let depth = 0; depth < 10 && node && node !== rootEl; depth += 1) {
+        node = node.parentElement;
+        if (!node) break;
+        const text = normalize(node.innerText || '');
+        const profiles = Array.from(node.querySelectorAll('a[href^="/"]')).filter(a => validHref(a.getAttribute('href')));
+        if (profiles.length !== 1 || !node.querySelector('time')) continue;
+        if (!text.includes(user) || !text.includes(comment)) continue;
+        if (text.length > 900) continue;
+        rows.push(node);
+        break;
+      }
+    }
 
-      let score = 0;
-      if (element === active) score += 100;
-      if (/reply|پاسخ/i.test(placeholder)) score += 100;
-      if (/add a comment|نظر|comment/i.test(placeholder)) score += 15;
-      score += Math.max(0, 40 - Math.abs(rect.bottom - innerHeight));
+    if (!rows.length) return null;
 
-      return {
-        element,
-        index,
-        score
-      };
+    const row = rows[0];
+    const rect = row.getBoundingClientRect();
+    const text = normalize(row.innerText || '');
+    const threadAncestor = (() => {
+      let current = row.parentElement;
+      for (let i = 0; i < 4 && current && current !== rootEl; i += 1, current = current.parentElement) {
+        const raw = normalize(current.innerText || '');
+        if (raw.includes(user) && raw.includes(comment) && raw.length <= 1800) return current;
+      }
+      return row.parentElement || row;
+    })();
+
+    const replyCountMatch = text.match(/(?:view all|hide all|view)\s+(\d+)\s+repl(?:y|ies)/i);
+    return {
+      targetLeft: rect.left,
+      targetTop: rect.top,
+      targetBottom: rect.bottom,
+      targetText: text,
+      replyCount: replyCountMatch ? Number(replyCountMatch[1]) : 0,
+      replyTextCount: 0,
+      threadToken: (() => {
+        const token = `ig-thread-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        threadAncestor.setAttribute('data-ig-thread-target', token);
+        return token;
+      })()
+    };
+  }, { username: targetUsername, commentText: targetComment }).catch(() => null);
+}
+
+
+async function verifyReplyIsNested(root, username, commentText, replyText, beforeStats) {
+  const normalizedReply = normalizeText(replyText);
+  const normalizedUser = normalizeText(username).replace(/^@/, '');
+
+  const verified = await root.evaluate(({ username, commentText, replyText, before }) => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const validHref = href => /^\/[^/]+\/?$/.test(String(href || '')) && !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(String(href || ''));
+    const visible = el => {
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+    };
+
+    const targetRows = [];
+    const markedTarget = rootEl.querySelector('[data-ig-target-row]');
+    if (markedTarget && visible(markedTarget)) {
+      targetRows.push(markedTarget);
+    }
+    if (targetRows.length) {
+      // The exact row was marked before the Reply click. Reuse it even if
+      // Instagram has temporarily added nested DOM below it.
+    } else for (const link of Array.from(rootEl.querySelectorAll('a[href^="/"]'))) {
+      if (!validHref(link.getAttribute('href'))) continue;
+      if (normalize(link.textContent || '') !== normalize(username)) continue;
+
+      let node = link;
+      for (let depth = 0; depth < 10 && node && node !== rootEl; depth += 1) {
+        node = node.parentElement;
+        if (!node || !visible(node)) continue;
+        const text = normalize(node.innerText || '');
+        const profiles = Array.from(node.querySelectorAll('a[href^="/"]')).filter(a => validHref(a.getAttribute('href')));
+        if (profiles.length !== 1 || !node.querySelector('time')) continue;
+        if (!text.includes(normalize(username)) || !text.includes(normalize(commentText)) || text.length > 900) continue;
+        targetRows.push(node);
+        break;
+      }
+    }
+
+    if (!targetRows.length) return { ok: false, reason: 'TARGET_ROW_GONE' };
+    const targetRow = targetRows[0];
+    const targetRect = targetRow.getBoundingClientRect();
+
+    const replyCandidates = [];
+    for (const link of Array.from(rootEl.querySelectorAll('a[href^="/"]'))) {
+      if (!validHref(link.getAttribute('href'))) continue;
+      let node = link;
+      for (let depth = 0; depth < 10 && node && node !== rootEl; depth += 1) {
+        node = node.parentElement;
+        if (!node || !visible(node)) continue;
+        const text = normalize(node.innerText || '');
+        const profiles = Array.from(node.querySelectorAll('a[href^="/"]')).filter(a => validHref(a.getAttribute('href')));
+        if (profiles.length !== 1 || !node.querySelector('time')) continue;
+        if (!text.includes(normalize(replyText)) || text.length > 900) continue;
+
+        const rect = node.getBoundingClientRect();
+        if (rect.top < targetRect.bottom - 5) continue;
+        replyCandidates.push({ node, rect, text });
+        break;
+      }
+    }
+
+    if (!replyCandidates.length) return { ok: false, reason: 'REPLY_ROW_NOT_FOUND' };
+
+    replyCandidates.sort((a, b) => Math.abs(a.rect.top - targetRect.bottom) - Math.abs(b.rect.top - targetRect.bottom));
+    const replyRow = replyCandidates[0].node;
+    const replyRect = replyCandidates[0].rect;
+
+    const hasMention = normalize(replyRow.innerText || '').includes(`@${normalize(username)}`);
+
+    // Strongest UI signal: the reply must be visually indented relative to the
+    // parent comment. A top-level comment posted with @mention has the same
+    // indentation as normal comments and therefore fails this gate.
+    const indented = replyRect.left >= targetRect.left + 10;
+
+    // Also require a local thread ancestor rather than the root comments list.
+    let localAncestor = replyRow.parentElement;
+    let local = false;
+    while (localAncestor && localAncestor !== rootEl) {
+      if (localAncestor.querySelector('[data-ig-target-row]')) {
+        local = true;
+        break;
+      }
+      localAncestor = localAncestor.parentElement;
+    }
+
+    // Finally accept a thread-control increase as supporting evidence.
+    const currentTargetText = normalize(targetRow.innerText || '');
+    const countMatch = currentTargetText.match(/(?:view all|hide all|view)\s+(\d+)\s+repl(?:y|ies)/i);
+    const currentCount = countMatch ? Number(countMatch[1]) : 0;
+    const countIncreased = currentCount > Number(before?.replyCount || 0);
+    const allText = normalize(rootEl.innerText || '');
+    const currentReplyTextCount = allText.split(normalize(replyText)).length - 1;
+    const replyTextIncreased = currentReplyTextCount > Number(before?.replyTextCount || 0);
+
+    const ok = local && (indented || countIncreased || replyTextIncreased);
+    return {
+      ok,
+      reason: ok ? 'VERIFIED' : 'NOT_NESTED',
+      hasMention,
+      indented,
+      local,
+      countIncreased,
+      beforeCount: Number(before?.replyCount || 0),
+      currentCount,
+      replyTextIncreased,
+      targetLeft: targetRect.left,
+      replyLeft: replyRect.left
+    };
+  }, {
+    username,
+    commentText,
+    replyText,
+    before: beforeStats || { replyCount: 0 }
+  }).catch(() => ({ ok: false, reason: 'VERIFY_EXCEPTION' }));
+
+  if (!verified?.ok) {
+    throw new Error('REPLY_NOT_CONFIRMED');
+  }
+
+  return verified;
+}
+
+
+async function sendReply(page, root, username, profilePath, commentText, replyText) {
+  if (!root) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
+  const textToSend = String(replyText || '').trim();
+  if (!textToSend) throw new Error('REPLY_NOT_CONFIRMED');
+
+  const beforeStats = await getCommentThreadStats(root, username, commentText);
+  if (!beforeStats) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
+  beforeStats.replyTextCount = await root.evaluate((text) => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const body = normalize(rootEl.innerText || '');
+    return body.split(normalize(text)).length - 1;
+  }, textToSend);
+
+  const row = await findCommentRow(root, {
+    username,
+    commentText,
+    profilePath
+  }, page);
+
+  const replyLocator = await locateReplyControl(page, row, username);
+
+  // Clear accidental focus from any general comment composer before clicking
+  // the row-level Reply control.
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(150);
+
+  let composer = null;
+  for (let clickAttempt = 0; clickAttempt < 2 && !composer; clickAttempt += 1) {
+    await replyLocator.hover().catch(() => {});
+    await replyLocator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async () => {
+      await replyLocator.evaluate(el => {
+        if (el instanceof HTMLElement) {
+          el.click();
+        } else {
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        }
+      }).catch(() => {});
     });
 
-    candidates.sort((a, b) => b.score - a.score || b.index - a.index);
+    try {
+      composer = await findReplyComposer(page, root, username);
+    } catch {
+      if (clickAttempt === 0) {
+        await page.waitForTimeout(450);
+        continue;
+      }
+      throw new Error('REPLY_UI_NOT_OPENED');
+    }
+  }
 
-    const best = candidates[0];
-    if (!best || best.score < 15) return null;
+  if (!composer?.input) throw new Error('REPLY_UI_NOT_OPENED');
 
-    const token = `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    best.element.setAttribute('data-ig-reply-composer', token);
+  const input = composer.input;
+  const beforeMeta = composer.meta;
+  const currentValue = String(beforeMeta.value || beforeMeta.text || '').trim();
 
-    return { token };
-  });
+  // Never replace the mention/token that Instagram inserted after Reply.
+  // Append text to the active reply composer instead.
+  await input.click();
+  if (currentValue) {
+    await input.press('End').catch(() => {});
+    await input.pressSequentially(` ${textToSend}`, { delay: 12 });
+  } else {
+    await input.pressSequentially(textToSend, { delay: 12 });
+  }
 
-  if (!composerDescriptor?.token) {
+  const afterValue = await input.inputValue().catch(() => '');
+  const afterText = await input.textContent().catch(() => '');
+  const replyPayload = normalizeText(`${afterValue} ${afterText}`);
+  if (!replyPayload.includes(normalizeText(textToSend))) {
     throw new Error('REPLY_UI_NOT_OPENED');
   }
 
-  const composerToken = String(composerDescriptor.token)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"');
+  // Send only from the active composer.
+  const composerScope = input.locator('xpath=ancestor::*[self::form or @role="dialog" or contains(@class,"comment")][1]');
+  const sendCandidates = [
+    composerScope.getByRole('button', { name: /Post|Send|ارسال|پست/i }).last(),
+    root.getByRole('button', { name: /^Post$|^Send$|^ارسال$|^پست$/i }).last()
+  ];
 
-  const input = page
-    .locator(`[data-ig-reply-composer="${composerToken}"]`)
-    .first();
-
-  if (!(await input.isVisible().catch(() => false))) {
-    throw new Error('REPLY_UI_NOT_OPENED');
+  let sent = false;
+  for (const button of sendCandidates) {
+    if (await button.isVisible().catch(() => false)) {
+      sent = await safeClick(button, 2500);
+      if (sent) break;
+    }
   }
 
-  const fillSucceeded = await input.fill(reply).then(
-    () => true,
-    () => false
-  );
-
-  if (!fillSucceeded) {
-    await input.click();
-    await input.pressSequentially(reply, { delay: 15 });
-  }
-
-  const entered = await input
-    .inputValue()
-    .catch(async () => await input.textContent().catch(() => ''));
-
-  if (!String(entered || '').trim()) {
-    throw new Error('REPLY_UI_NOT_OPENED');
-  }
-
-  const sendButton = page.getByRole('button', {
-    name: /Send|Post|ارسال|پست/i
-  }).last();
-
-  let sentByButton = await safeClick(sendButton, 2500);
-
-  if (!sentByButton) {
+  if (!sent) {
     await input.press('Enter');
   }
 
+  appendLog('REPLY_SUBMIT_TRIGGERED', { username });
+
+  // Allow React/Instagram to commit the reply before verifying.
   await page.waitForTimeout(900);
 
-  const normalizedReply = normalizeText(reply);
-
-  /*
-   * Verification is intentionally tied to the original comment row/thread.
-   * "composer is empty" alone is NOT success.
-   */
-  const verified = await page.waitForFunction(
-    ({ rowSelector, replyText }) => {
-      const normalize = value => String(value || '')
-        .normalize('NFKC')
-        .toLocaleLowerCase('fa')
-        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
-        .replace(/[ًٌٍَُِّْـ]/g, '')
-        .replace(/ي/g, 'ی')
-        .replace(/ى/g, 'ی')
-        .replace(/ك/g, 'ک')
-        .replace(/[ۀە]/g, 'ه')
-        .replace(/[أإآ]/g, 'ا')
-        .replace(/ؤ/g, 'و')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      const row = document.querySelector(rowSelector);
-      if (!row) return false;
-
-      const normalizedTargetReply = normalize(replyText);
-      const containsReply = element =>
-        normalize(element.innerText || '').includes(normalizedTargetReply);
-
-      if (containsReply(row)) return true;
-
-      /*
-       * Instagram may render a reply as a sibling under a logical thread
-       * wrapper instead of as a child of the original comment row.
-       */
-      let scope = row.parentElement;
-
-      for (let depth = 0; depth < 3 && scope; depth += 1) {
-        const profileLinks = Array.from(
-          scope.querySelectorAll('a[href^="/"]')
-        ).filter(a => {
-          const href = String(a.getAttribute('href') || '');
-          return (
-            /^\/[^/]+\/?$/.test(href) &&
-            !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href)
-          );
-        });
-
-        if (profileLinks.length >= 1 && containsReply(scope)) {
-          return true;
-        }
-
-        scope = scope.parentElement;
-      }
-
-      return false;
-    },
-    {
-      rowSelector: `[data-ig-target-row="${String(
-        await row.getAttribute('data-ig-target-row')
-      ).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`,
-      replyText: normalizedReply
-    },
-    { timeout: 7000 }
-  ).catch(() => false);
-
-  if (!verified) {
+  try {
+    await verifyReplyIsNested(root, username, commentText, textToSend, beforeStats);
+  } catch {
     throw new Error('REPLY_NOT_CONFIRMED');
   }
+
+  return true;
+}
+
+
+async function getProfilePrivacyState(page) {
+  return page.evaluate(() => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const text = normalize(document.body.innerText || '');
+    const privatePatterns = [
+      'this account is private',
+      'این حساب خصوصی است',
+      'حساب خصوصی است'
+    ];
+
+    return privatePatterns.some(pattern => text.includes(pattern));
+  }).catch(() => false);
+}
+
+
+async function clickProfileMessageAction(dmPage, isPrivate) {
+  const messageRegex = /^(Message|Send message|پیام|ارسال پیام|ارسال پیام مستقیم)$/i;
+  const moreRegex = /^(More options|Options|More|گزینه‌های بیشتر|گزینه ها|بیشتر)$/i;
+
+  if (!isPrivate) {
+    const directCandidates = [
+      dmPage.getByRole('button', { name: messageRegex }).first(),
+      dmPage.getByRole('link', { name: messageRegex }).first()
+    ];
+    for (const direct of directCandidates) {
+      if (await direct.isVisible().catch(() => false)) {
+        if (await safeClick(direct, 3500)) return 'message-button';
+      }
+    }
+  }
+
+  // Private profiles (and profiles where Message is hidden) commonly expose
+  // the DM action through the profile header's three-dot More menu.
+  const moreCandidates = [
+    dmPage.getByRole('button', { name: moreRegex }).first(),
+    dmPage.locator('button[aria-label*="More" i],button[aria-label*="Options" i],button[aria-label*="گزینه" i],button[aria-label*="بیشتر" i]').first(),
+    dmPage.locator('header button').filter({ has: dmPage.locator('svg') }).last()
+  ];
+
+  let menuOpened = false;
+  for (const more of moreCandidates) {
+    if (await more.isVisible().catch(() => false)) {
+      if (await safeClick(more, 2500)) {
+        menuOpened = true;
+        break;
+      }
+    }
+  }
+
+  if (menuOpened) {
+    await dmPage.waitForTimeout(350);
+
+    const menuItems = [
+      dmPage.getByRole('menuitem', { name: messageRegex }).first(),
+      dmPage.getByText(messageRegex).last(),
+      dmPage.locator('[role="menu"] [role="menuitem"]').filter({ hasText: /Message|Send message|پیام|ارسال پیام/i }).last()
+    ];
+
+    for (const item of menuItems) {
+      if (await item.isVisible().catch(() => false)) {
+        if (await safeClick(item, 3000)) return isPrivate ? 'private-menu-message' : 'more-menu-message';
+      }
+    }
+  }
+
+  // A private account may still expose the Message button after the profile
+  // finishes hydrating; retry once after the menu attempt.
+  const delayedCandidates = [
+    dmPage.getByRole('button', { name: messageRegex }).first(),
+    dmPage.getByRole('link', { name: messageRegex }).first()
+  ];
+  for (const delayed of delayedCandidates) {
+    if (await delayed.isVisible().catch(() => false)) {
+      if (await safeClick(delayed, 2500)) return 'message-button-delayed';
+    }
+  }
+
+  throw new Error('DM_MESSAGE_ACTION_NOT_FOUND');
 }
 
 
 async function sendDM(dmPage, profilePath, username, message) {
-  const rawProfilePath = String(profilePath || '').trim();
+  const rawProfile = String(profilePath || '').trim();
+  const messageText = String(message || '').trim();
+  if (!rawProfile) throw new Error(`INVALID_PROFILE_URL:${username}`);
+  if (!messageText) throw new Error(`DM_NOT_CONFIRMED:${username}`);
 
   let profileUrl;
-
   try {
-    if (/^https?:\/\//i.test(rawProfilePath)) {
-      const parsed = new URL(rawProfilePath);
-
-      if (
-        parsed.hostname !== 'instagram.com' &&
-        !parsed.hostname.endsWith('.instagram.com')
-      ) {
-        throw new Error('invalid-host');
-      }
-
-      profileUrl = parsed.href;
+    if (/^https?:\/\//i.test(rawProfile)) {
+      const url = new URL(rawProfile);
+      if (!/^(www\.)?instagram\.com$/i.test(url.hostname)) throw new Error('external-host');
+      profileUrl = url.href;
     } else {
-      const normalizedPath = rawProfilePath.startsWith('/')
-        ? rawProfilePath
-        : `/${rawProfilePath}`;
-
-      profileUrl = new URL(
-        normalizedPath,
-        'https://www.instagram.com'
-      ).href;
+      const pathPart = rawProfile.startsWith('/') ? rawProfile : `/${rawProfile}`;
+      profileUrl = new URL(pathPart, 'https://www.instagram.com').href;
     }
   } catch {
     throw new Error(`INVALID_PROFILE_URL:${username}`);
   }
 
-  await dmPage.goto(profileUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: 30000
-  });
-
-  await dmPage.waitForTimeout(1000);
+  await dmPage.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await dmPage.waitForTimeout(1200);
   await dismissCommonPopups(dmPage);
+  await dismissTransientOverlay(dmPage);
 
-  let opened = await safeClick(
-    dmPage.getByRole('button', {
-      name: /Message|Send message|پیام|ارسال پیام/i
-    }).first(),
-    3500
-  );
+  const isPrivate = await getProfilePrivacyState(dmPage);
+  appendLog('DM_PROFILE_OPENED', { username, profile: rawProfile, private: isPrivate });
 
-  if (!opened) {
-    const moreButton = dmPage.getByRole('button', {
-      name: /More options|گزینه‌های بیشتر/i
-    }).first();
-
-    if (await moreButton.isVisible().catch(() => false)) {
-      await safeClick(moreButton, 2000);
-      await dmPage.waitForTimeout(400);
-
-      opened = await safeClick(
-        dmPage.getByText(
-          /^(Message|Send message|پیام|ارسال پیام)$/i
-        ).first(),
-        3000
-      );
-    }
-  }
-
-  if (!opened) {
-    throw new Error(`MESSAGE_BUTTON_NOT_FOUND:${username}`);
-  }
+  const action = await clickProfileMessageAction(dmPage, isPrivate);
+  appendLog('DM_MESSAGE_ACTION_FOUND', { username, action, private: isPrivate });
 
   await dmPage.waitForTimeout(700);
 
   const inputs = [
-    dmPage.getByPlaceholder(/Message|پیام/i).last(),
+    dmPage.getByPlaceholder(/^(Message|پیام)(\.\.\.|…)?$/i).last(),
+    dmPage.getByLabel(/^(Message|پیام)/i).last(),
     dmPage.locator('textarea').last(),
     dmPage.locator('[contenteditable="true"]').last()
   ];
 
   let input = null;
-
   for (const candidate of inputs) {
     if (await candidate.isVisible().catch(() => false)) {
       input = candidate;
@@ -1679,87 +1736,28 @@ async function sendDM(dmPage, profilePath, username, message) {
     }
   }
 
-  if (!input) {
-    throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
-  }
+  if (!input) throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
 
-  const messageText = String(message || '').trim();
-  if (!messageText) {
-    throw new Error(`DM_NOT_CONFIRMED:${username}`);
-  }
+  const beforeBody = normalizeText(await dmPage.locator('body').innerText().catch(() => ''));
+  const beforeCount = beforeBody.split(normalizeText(messageText)).length - 1;
 
-  /*
-   * Count existing occurrences before sending so a pre-existing identical
-   * message cannot by itself satisfy verification.
-   */
-  const normalizedMessage = normalizeText(messageText);
-  const beforeCount = await dmPage.evaluate(messageValue => {
-    const normalize = value => String(value || '')
-      .normalize('NFKC')
-      .toLocaleLowerCase('fa')
-      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
-      .replace(/[ًٌٍَُِّْـ]/g, '')
-      .replace(/ي/g, 'ی')
-      .replace(/ى/g, 'ی')
-      .replace(/ك/g, 'ک')
-      .replace(/[ۀە]/g, 'ه')
-      .replace(/[أإآ]/g, 'ا')
-      .replace(/ؤ/g, 'و')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const body = normalize(document.body.innerText || '');
-    const needle = normalize(messageValue);
-
-    if (!needle) return 0;
-
-    let count = 0;
-    let offset = 0;
-
-    while (true) {
-      const index = body.indexOf(needle, offset);
-      if (index === -1) break;
-      count += 1;
-      offset = index + needle.length;
-    }
-
-    return count;
-  }, normalizedMessage);
-
-  const filled = await input.fill(messageText).then(
-    () => true,
-    () => false
-  );
-
-  if (!filled) {
+  if (!(await input.fill(messageText).catch(() => false))) {
     await input.click();
-    await input.pressSequentially(messageText, { delay: 15 });
+    await input.pressSequentially(messageText, { delay: 12 });
   }
 
-  const sendButton = dmPage.getByRole('button', {
-    name: /Send|ارسال/i
-  }).last();
-
-  if (!(await safeClick(sendButton, 2500))) {
-    await input.press('Enter');
+  const sendButton = dmPage.getByRole('button', { name: /^(Send|ارسال)$/i }).last();
+  let sent = false;
+  if (await sendButton.isVisible().catch(() => false)) {
+    sent = await safeClick(sendButton, 2500);
   }
+  if (!sent) await input.press('Enter');
 
-  await dmPage.waitForTimeout(900);
-
-  let inputValue = await input
-    .inputValue()
-    .catch(() => input.textContent().catch(() => ''));
-
-  if (String(inputValue || '').trim()) {
-    await input.press('Enter');
-    await dmPage.waitForTimeout(800);
-    inputValue = await input
-      .inputValue()
-      .catch(() => input.textContent().catch(() => ''));
-  }
+  appendLog('DM_SUBMIT_TRIGGERED', { username });
+  await dmPage.waitForTimeout(1200);
 
   const verified = await dmPage.waitForFunction(
-    ({ messageValue, originalCount }) => {
+    ({ normalizedMessage, beforeCount }) => {
       const normalize = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -1775,40 +1773,44 @@ async function sendDM(dmPage, profilePath, username, message) {
         .trim();
 
       const body = normalize(document.body.innerText || '');
-      const needle = normalize(messageValue);
-
-      if (!needle) return false;
-
-      let count = 0;
-      let offset = 0;
-
-      while (true) {
-        const index = body.indexOf(needle, offset);
-        if (index === -1) break;
-        count += 1;
-        offset = index + needle.length;
-      }
-
-      const inputs = Array.from(
-        document.querySelectorAll('textarea,[contenteditable="true"]')
-      );
-
-      const anyInputStillFilled = inputs.some(element =>
-        String(element.value || element.textContent || '').trim()
-      );
-
-      return count > originalCount && !anyInputStillFilled;
+      const count = body.split(normalizedMessage).length - 1;
+      const inputs = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]'))
+        .filter(el => {
+          const r = el.getBoundingClientRect();
+          const s = getComputedStyle(el);
+          return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+        });
+      const hasFilledComposer = inputs.some(el => String(el.value || el.textContent || '').trim());
+      return count > Number(beforeCount || 0) && !hasFilledComposer;
     },
-    {
-      messageValue: normalizedMessage,
-      originalCount: beforeCount
-    },
-    { timeout: 7000 }
+    { normalizedMessage: normalizeText(messageText), beforeCount },
+    { timeout: 8000 }
   ).catch(() => false);
 
-  if (!verified) {
-    throw new Error(`DM_NOT_CONFIRMED:${username}`);
+  if (!verified) throw new Error(`DM_NOT_CONFIRMED:${username}`);
+
+  return true;
+}
+
+
+async function ensureCommentsUi(page, postUrl) {
+  const existingRoot = page.locator('[data-ig-comment-root="1"]').first();
+  if (await existingRoot.isVisible().catch(() => false)) {
+    return existingRoot;
   }
+
+  await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(1200);
+  await dismissCommonPopups(page);
+
+  const clickInfo = await clickRealCommentButton(page);
+  appendLog('COMMENT_BUTTON_FOUND', { url: postUrl, strategy: clickInfo.strategy, returnFlow: true });
+  appendLog('COMMENT_BUTTON_CLICKED', { url: postUrl, strategy: clickInfo.strategy, returnFlow: true });
+
+  const descriptor = await waitForCommentRoot(page);
+  if (!descriptor || !descriptor.rowCount) throw new Error('REPLY_COMMENT_UI_NOT_REOPENED');
+  await markCommentRoot(page, descriptor);
+  return getRootLocator(page);
 }
 
 
@@ -1886,84 +1888,78 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
         status: 'pending'
       };
 
-      appendLog('MATCH_FOUND', { url, username: comment.username, keyword: match.keyword, matchMode: match.mode, distance: match.distance });
+      appendLog('MATCH_FOUND', {
+        url,
+        username: comment.username,
+        keyword: match.keyword,
+        matchMode: match.mode,
+        distance: match.distance
+      });
 
       let failurePage = page;
-      let failureStage = 'comment-row';
+      let failureStage = 'reply';
 
       try {
+        // IMPORTANT ORDER:
+        //   1) open author's profile
+        //   2) send DM and verify it
+        //   3) return to the post/comment list
+        //   4) find the same comment again
+        //   5) enter Reply mode and verify the reply is actually nested
+        // We intentionally do NOT attempt the public comment reply before DM.
+        appendLog('DM_ATTEMPT', {
+          url,
+          username: comment.username,
+          profile: comment.profilePath
+        });
+        failurePage = dmPage;
+        failureStage = 'dm';
+
+        await sendDM(dmPage, comment.profilePath, comment.username, dmReply);
+        item.dm = 'sent';
+        appendLog('DM_SENT', {
+          url,
+          username: comment.username,
+          profile: comment.profilePath
+        });
+
+        appendLog('COMMENTS_RETURN_ATTEMPT', {
+          url,
+          username: comment.username
+        });
+
+        const returnedRoot = await ensureCommentsUi(page, url);
+        failurePage = page;
+        failureStage = 'reply';
+
+        // The original root may have been re-rendered while the DM page was
+        // active. Always use the fresh root returned above.
+        const replyRoot = returnedRoot;
+
         appendLog('REPLY_ATTEMPT', {
           url,
           username: comment.username,
           keyword: match.keyword
         });
 
-        const row = await findCommentRow(root, comment, page);
-        failurePage = page;
-        failureStage = 'reply';
-
-        await sendReply(page, row, commentReply);
+        await sendReply(
+          page,
+          replyRoot,
+          comment.username,
+          comment.profilePath,
+          comment.commentText,
+          commentReply
+        );
 
         item.reply = 'sent';
+        item.status = 'done';
+        postLog.matchesCompleted++;
+
         appendLog('REPLY_SENT', {
           url,
           username: comment.username,
           keyword: match.keyword
         });
-
-        /*
-         * Do not trust the profile path captured during the initial scan.
-         * Re-read it from the exact comment row that received the reply.
-         */
-        const profilePathFromRow = await row.evaluate(rowEl => {
-          const validProfileHref = href => {
-            const value = String(href || '');
-            return (
-              /^\/[^/]+\/?$/.test(value) &&
-              !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(value)
-            );
-          };
-
-          const links = Array.from(
-            rowEl.querySelectorAll('a[href^="/"]')
-          ).filter(link => validProfileHref(link.getAttribute('href')));
-
-          if (links.length !== 1) return null;
-          return links[0].getAttribute('href') || null;
-        }).catch(() => null);
-
-        if (!profilePathFromRow) {
-          throw new Error('COMMENT_PROFILE_NOT_FOUND');
-        }
-
-        item.profile = profilePathFromRow;
-
-        appendLog('DM_ATTEMPT', {
-          url,
-          username: comment.username,
-          profile: profilePathFromRow
-        });
-
-        failurePage = dmPage;
-        failureStage = 'dm';
-
-        await sendDM(
-          dmPage,
-          profilePathFromRow,
-          comment.username,
-          dmReply
-        );
-
-        item.dm = 'sent';
-        item.status = 'done';
-        postLog.matchesCompleted++;
-
-        appendLog('DM_SENT', {
-          url,
-          username: comment.username,
-          profile: profilePathFromRow
-        });
-
         appendLog('MATCH_COMPLETED', {
           url,
           username: comment.username,

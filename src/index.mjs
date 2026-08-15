@@ -194,6 +194,25 @@ async function dismissCommonPopups(page) {
   }
 }
 
+async function dismissTransientOverlay(page) {
+  if (!page || page.isClosed()) return;
+
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(250).catch(() => {});
+
+  const closeCandidates = [
+    page.getByRole('button', { name: /Close|Dismiss|Back|بستن|بازگشت/i }).first(),
+    page.locator('button[aria-label*="Close"],button[aria-label*="بستن"],button[title*="Close"],button[title*="بستن"]').first()
+  ];
+
+  for (const candidate of closeCandidates) {
+    if (await candidate.isVisible().catch(() => false)) {
+      await safeClick(candidate, 700);
+      await page.waitForTimeout(200).catch(() => {});
+    }
+  }
+}
+
 async function login(page, context) {
   await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1200);
@@ -223,10 +242,74 @@ function validProfileHref(href) {
   return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(v);
 }
 
+function scoreCommentButtonCandidate(candidate, viewport) {
+  const label = `${candidate.aria} ${candidate.title} ${candidate.text} ${candidate.label}`.trim();
+  const normalized = normalizeText(label);
+
+  const inActionRail =
+    candidate.rect.left > viewport.width * 0.70 &&
+    candidate.rect.top > 120 &&
+    candidate.rect.top < viewport.height - 70;
+
+  const rightSide = candidate.rect.left > viewport.width * 0.55;
+  const smallIcon = candidate.rect.width <= 100 && candidate.rect.height <= 100;
+  const explicitComment = /(^|\b)(comment|comments|نظر|دیدگاه|کامنت)(\b|$)/i.test(label);
+  const commentCountLabel =
+    /\b\d+\s*(comments?|نظر(ها)?|دیدگاه(ها)?|کامنت(?:ها)?)\b/i.test(label) ||
+    /\bcomments?\b/i.test(normalized) ||
+    /\bنظر(ها)?\b/i.test(normalized) ||
+    /\bدیدگاه(ها)?\b/i.test(normalized);
+
+  const strongExclude = /\b(message|send message|send|share|repost|forward|like|save|bookmark|follow|close|back|next|previous|menu|options|more options|open chat|direct|dm)\b/i.test(normalized);
+  const weakExclude = /\b(profile|visit profile|view profile|open profile)\b/i.test(normalized);
+
+  let score = 0;
+  score += explicitComment ? 90 : 0;
+  score += commentCountLabel ? 35 : 0;
+  score += inActionRail ? 32 : 0;
+  score += rightSide ? 12 : 0;
+  score += smallIcon ? 12 : 0;
+  score += candidate.svgCount > 0 ? 6 : 0;
+  score += candidate.buttonLike ? 4 : 0;
+  score += /^\d+$/.test(candidate.text) ? 4 : 0;
+  score += candidate.text.length <= 4 && /[\p{P}\p{S}]/u.test(candidate.text) ? 3 : 0;
+  score -= candidate.href ? 10 : 0;
+  score -= strongExclude ? 60 : 0;
+  score -= weakExclude ? 22 : 0;
+  score -= candidate.rect.width > 220 || candidate.rect.height > 180 ? 20 : 0;
+  score -= candidate.text.length > 40 ? 10 : 0;
+
+  const strategy = explicitComment
+    ? 'explicit-label'
+    : commentCountLabel
+      ? 'count-label'
+      : inActionRail
+        ? 'action-rail'
+        : rightSide
+          ? 'right-side'
+          : 'heuristic';
+
+  return { ...candidate, score, strategy, label };
+}
+
 async function inspectCommentButtonCandidates(page) {
   return page.evaluate(() => {
     const vw = innerWidth;
     const vh = innerHeight;
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     return Array.from(document.querySelectorAll('button,[role="button"],a'))
       .map((el, index) => {
         const r = el.getBoundingClientRect();
@@ -259,6 +342,8 @@ async function inspectCommentButtonCandidates(page) {
           title,
           text,
           label,
+          normalizedLabel: normalize(label),
+          normalizedText: normalize(text),
           svgCount,
           role: el.getAttribute('role') || '',
           rect: {
@@ -276,114 +361,71 @@ async function inspectCommentButtonCandidates(page) {
   });
 }
 
-async function findCommentButton(page) {
-  const candidates = await inspectCommentButtonCandidates(page);
-  if (!candidates.length) return null;
-
+async function rankCommentButtonCandidates(page) {
   const viewport = page.viewportSize() || { width: 1440, height: 1000 };
-  const explicitMatch = candidates.find(c => {
-    const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
-    return /(^|\b)(comment|comments|نظر|دیدگاه|کامنت)(\b|$)/i.test(label);
-  });
-  if (explicitMatch) {
-    return { ...explicitMatch, strategy: 'explicit-label' };
-  }
+  const candidates = await inspectCommentButtonCandidates(page);
+  return candidates
+    .map(candidate => scoreCommentButtonCandidate(candidate, viewport))
+    .sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+}
 
-  const bands = new Map();
-  for (const c of candidates) {
-    const inActionBarZone = c.rect.top > 180 && c.rect.top < viewport.height - 60;
-    if (!inActionBarZone) continue;
-    const bandKey = Math.round(c.rect.top / 26);
-    const arr = bands.get(bandKey) || [];
-    arr.push(c);
-    bands.set(bandKey, arr);
-  }
-
-  const scoredBands = Array.from(bands.entries())
-    .map(([bandKey, items]) => {
-      const unique = items
-        .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top)
-        .filter((item, index, array) => index === 0 || Math.abs(item.rect.left - array[index - 1].rect.left) > 4);
-
-      const widthSum = unique.reduce((sum, c) => sum + c.rect.width, 0);
-      const svgSum = unique.reduce((sum, c) => sum + c.svgCount, 0);
-      const hrefPenalty = unique.reduce((sum, c) => sum + (c.href ? 1 : 0), 0);
-      const buttonLikeCount = unique.filter(c => c.buttonLike).length;
-      const tinyIconCount = unique.filter(c => c.rect.width <= 90 && c.rect.height <= 90).length;
-
-      const score =
-        unique.length * 18 +
-        buttonLikeCount * 8 +
-        svgSum * 5 +
-        tinyIconCount * 6 -
-        hrefPenalty * 10 -
-        Math.max(0, Math.floor(widthSum / 250));
-
-      return { bandKey, items: unique, score };
-    })
-    .filter(x => x.items.length >= 2)
-    .sort((a, b) => b.score - a.score || a.bandKey - b.bandKey);
-
-  if (scoredBands.length) {
-    const bestBand = scoredBands[0];
-    const ordered = bestBand.items.slice().sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
-    const byHeuristic = ordered.find(c => {
-      const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
-      return /comment|comments|نظر|دیدگاه|کامنت/i.test(label);
-    });
-    if (byHeuristic) {
-      return { ...byHeuristic, strategy: 'band-explicit' };
-    }
-
-    const preferredIndex = ordered.length >= 2 ? 1 : 0;
-    const preferred = ordered[preferredIndex] || ordered[0];
-    if (preferred) {
-      return { ...preferred, strategy: ordered.length >= 2 ? 'band-second-button' : 'band-first-button' };
-    }
-  }
-
-  let best = null;
-  for (const c of candidates) {
-    const label = `${c.aria} ${c.title} ${c.text} ${c.label}`;
-    const looksLikeActionBar = c.rect.top > 200 && c.rect.top < viewport.height - 70 && c.rect.left > viewport.width * 0.25;
-    const nearLikeBar = c.rect.width <= 90 && c.rect.height <= 90;
-    const score = [
-      /comment/i.test(c.aria) ? 40 : 0,
-      /comment/i.test(c.title) ? 25 : 0,
-      /comment/i.test(label) ? 20 : 0,
-      c.svgCount > 0 ? 8 : 0,
-      looksLikeActionBar ? 12 : 0,
-      nearLikeBar ? 8 : 0,
-      c.text.length <= 25 ? 5 : 0,
-      /[^\w\s]/.test(c.text) && c.text.length <= 2 ? 2 : 0,
-      c.href ? -12 : 0
-    ].reduce((a, b) => a + b, 0);
-
-    if (!best || score > best.score) {
-      best = { ...c, score, strategy: 'heuristic' };
-    }
-  }
-
-  if (!best || best.score < 22) return null;
-  return best;
+async function findCommentButton(page) {
+  const ranked = await rankCommentButtonCandidates(page);
+  if (!ranked.length) return null;
+  return ranked[0];
 }
 
 async function clickRealCommentButton(page) {
-  const found = await findCommentButton(page);
-  if (!found) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  const ranked = await rankCommentButtonCandidates(page);
+  if (!ranked.length) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
 
-  const handle = await page.evaluateHandle(({ index }) => {
-    const nodes = Array.from(document.querySelectorAll('button,[role="button"],a'));
-    return nodes[index] || null;
-  }, { index: found.index });
+  let sawAnyCandidate = false;
 
-  const button = handle.asElement();
-  if (!button) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  for (const candidate of ranked.slice(0, 8)) {
+    sawAnyCandidate = true;
+    appendLog('COMMENT_BUTTON_ATTEMPT', {
+      strategy: candidate.strategy,
+      score: candidate.score,
+      label: candidate.label,
+      rect: candidate.rect
+    });
 
-  await button.scrollIntoViewIfNeeded().catch(() => {});
-  await button.click({ timeout: CLICK_TIMEOUT_MS });
-  await handle.dispose().catch(() => {});
-  return found;
+    const locator = page.locator('button,[role="button"],a').nth(candidate.index);
+    if (!(await locator.isVisible().catch(() => false))) {
+      appendLog('COMMENT_BUTTON_SKIP_INVISIBLE', { strategy: candidate.strategy, score: candidate.score });
+      continue;
+    }
+
+    await locator.scrollIntoViewIfNeeded().catch(() => {});
+    await locator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async error => {
+      appendLog('COMMENT_BUTTON_CLICK_FAILED', {
+        strategy: candidate.strategy,
+        score: candidate.score,
+        error: String(error?.message || error)
+      });
+    });
+
+    const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 6000));
+    if (verified) {
+      appendLog('COMMENT_UI_VERIFIED', {
+        strategy: candidate.strategy,
+        score: candidate.score,
+        label: candidate.label
+      });
+      return candidate;
+    }
+
+    appendLog('COMMENT_BUTTON_VERIFY_FAILED', {
+      strategy: candidate.strategy,
+      score: candidate.score
+    });
+
+    await dismissTransientOverlay(page);
+    await page.waitForTimeout(300);
+  }
+
+  if (!sawAnyCandidate) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  throw new Error('COMMENT_UI_DID_NOT_OPEN');
 }
 
 async function getCommentRootDescriptor(page) {
@@ -422,6 +464,8 @@ async function getCommentRootDescriptor(page) {
       const replyCount = (text.match(/\bReply\b/gi) || []).length + (text.match(/پاسخ/g) || []).length;
       const addCommentCount = (text.match(/Add a comment/gi) || []).length + (text.match(/نظر خود را بنویسید|افزودن نظر/gi) || []).length;
       const moreCount = (text.match(/View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات/gi) || []).length;
+      const messageCount = (text.match(/Message|Send message|پیام|ارسال پیام/gi) || []).length;
+      const sendCount = (text.match(/\bSend\b|ارسال/gi) || []).length;
 
       let rowCount = 0;
       const seen = new Set();
@@ -452,9 +496,11 @@ async function getCommentRootDescriptor(page) {
       score += Math.min(80, rowCount * 18);
       score += Math.min(15, moreCount * 8);
       score -= Math.min(20, addCommentCount * 5);
+      score -= Math.min(25, messageCount * 6);
+      score -= Math.min(15, sendCount * 2);
       if (textLen > 9000) score -= 18;
       if (textLen < 150) score -= 18;
-      if (profileCount < 2) score -= 30;
+      if (profileCount < 1) score -= 30;
       if (rowCount < 1) score -= 40;
       if (!timeCount && !replyCount) score -= 16;
 
@@ -491,11 +537,21 @@ async function getCommentRootDescriptor(page) {
   });
 }
 
-async function waitForCommentRoot(page) {
-  const deadline = Date.now() + ROOT_TIMEOUT_MS;
+async function waitForCommentRoot(page, timeoutMs = ROOT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const root = await getCommentRootDescriptor(page);
-    if (root && (root.rowCount >= 1 && (root.profileCount >= 2 || root.timeCount >= 1 || root.replyCount >= 1))) {
+    if (
+      root &&
+      root.rowCount >= 1 &&
+      (
+        root.profileCount >= 2 ||
+        root.timeCount >= 1 ||
+        root.replyCount >= 1 ||
+        root.moreCount >= 1 ||
+        (root.profileCount >= 1 && root.scrollable)
+      )
+    ) {
       return root;
     }
     await page.waitForTimeout(350);

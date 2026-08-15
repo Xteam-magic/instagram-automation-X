@@ -650,20 +650,14 @@ async function findCommentButton(
     }
   }
 
-  /*
-   * Fallback:
-   * Comment is the icon immediately after Like.
-   */
   const sorted =
-    icons
-      .slice()
-      .sort(
-        (a, b) =>
-          a.rect.left -
-            b.rect.left ||
-          a.rect.top -
-            b.rect.top
-      );
+    icons.slice().sort(
+      (a, b) =>
+        a.rect.left -
+          b.rect.left ||
+        a.rect.top -
+          b.rect.top
+    );
 
   for (
     let i = 0;
@@ -756,18 +750,179 @@ async function clickRealCommentButton(
 async function getCommentRootDescriptor(
   page
 ) {
-  return page.evaluate(
-    () => {
-      const validProfileHref =
-        href =>
-          /^\/[^/]+\/?$/.test(
-            href || ''
-          ) &&
-          !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
-            href || ''
+  return page.evaluate(() => {
+    const validProfileHref =
+      href =>
+        /^\/[^/]+\/?$/.test(
+          href || ''
+        ) &&
+        !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
+          href || ''
+        );
+
+    const scoreRoot =
+      el => {
+        const r =
+          el.getBoundingClientRect();
+
+        const s =
+          getComputedStyle(
+            el
           );
 
-      const scoreRoot =
+        const text =
+          el.innerText || '';
+
+        let score = 0;
+
+        const profileCount =
+          Array.from(
+            el.querySelectorAll(
+              'a[href^="/"]'
+            )
+          ).filter(
+            a =>
+              validProfileHref(
+                a.getAttribute(
+                  'href'
+                )
+              )
+          ).length;
+
+        const replyCount =
+          (
+            text.match(
+              /\bReply\b/gi
+            ) || []
+          ).length +
+          (
+            text.match(
+              /پاسخ/g
+            ) || []
+          ).length;
+
+        const timeCount =
+          el.querySelectorAll(
+            'time'
+          ).length;
+
+        if (
+          profileCount >= 2
+        ) {
+          score += Math.min(
+            60,
+            profileCount * 6
+          );
+        }
+
+        if (
+          replyCount
+        ) {
+          score += Math.min(
+            30,
+            replyCount * 5
+          );
+        }
+
+        if (
+          timeCount
+        ) {
+          score += Math.min(
+            15,
+            timeCount * 2
+          );
+        }
+
+        if (
+          /View more comments|View all \d+ comments|Load more comments/i.test(
+            text
+          )
+        ) {
+          score += 30;
+        }
+
+        if (
+          /Add a comment/i.test(
+            text
+          )
+        ) {
+          score += 5;
+        }
+
+        if (
+          /(auto|scroll)/.test(
+            s.overflowY
+          ) &&
+          el.scrollHeight >
+            el.clientHeight +
+              80
+        ) {
+          score += 30;
+        }
+
+        if (
+          r.right >
+          innerWidth * 0.55
+        ) {
+          score += 15;
+        }
+
+        if (
+          r.width >= 280 &&
+          r.width <= 650
+        ) {
+          score += 10;
+        }
+
+        if (
+          r.height >= 250
+        ) {
+          score += 10;
+        }
+
+        return {
+          score,
+          profileCount,
+          replyCount,
+          timeCount,
+          scrollable:
+            /(auto|scroll)/.test(
+              s.overflowY
+            ) &&
+            el.scrollHeight >
+              el.clientHeight +
+                80,
+          rect: {
+            x:
+              r.x,
+            y:
+              r.y,
+            width:
+              r.width,
+            height:
+              r.height
+          },
+          scrollHeight:
+            el.scrollHeight,
+          clientHeight:
+            el.clientHeight,
+          textSample:
+            text.slice(
+              0,
+              900
+            )
+        };
+      };
+
+    const all =
+      Array.from(
+        document.querySelectorAll(
+          'body *'
+        )
+      );
+
+    const visible =
+      all.filter(
         el => {
           const r =
             el.getBoundingClientRect();
@@ -777,319 +932,124 @@ async function getCommentRootDescriptor(
               el
             );
 
-          const text =
-            el.innerText || '';
+          return (
+            s.display !==
+              'none' &&
+            s.visibility !==
+              'hidden' &&
+            r.width > 0 &&
+            r.height > 0
+          );
+        }
+      );
 
-          let score = 0;
+    const dialogs =
+      visible.filter(
+        el =>
+          el.getAttribute(
+            'role'
+          ) ===
+            'dialog' &&
+          el.getBoundingClientRect()
+            .width >= 250 &&
+          el.getBoundingClientRect()
+            .height >= 250
+      );
 
-          const profileCount =
-            Array.from(
-              el.querySelectorAll(
-                'a[href^="/"]'
-              )
-            ).filter(
-              a =>
-                validProfileHref(
-                  a.getAttribute(
-                    'href'
-                  )
-                )
-            ).length;
+    const sources =
+      dialogs.length
+        ? dialogs
+        : visible.filter(
+            el => {
+              const r =
+                el.getBoundingClientRect();
 
-          const replyCount =
-            (
-              text.match(
-                /\bReply\b/gi
-              ) || []
-            ).length +
-            (
-              text.match(
-                /پاسخ/g
-              ) || []
-            ).length;
-
-          const timeCount =
-            el.querySelectorAll(
-              'time'
-            ).length;
-
-          if (
-            profileCount >= 2
-          ) {
-            score += Math.min(
-              60,
-              profileCount * 6
-            );
-          }
-
-          if (
-            replyCount
-          ) {
-            score += Math.min(
-              30,
-              replyCount * 5
-            );
-          }
-
-          if (
-            timeCount
-          ) {
-            score += Math.min(
-              15,
-              timeCount * 2
-            );
-          }
-
-          if (
-            /View more comments|View all \d+ comments|Load more comments/i.test(
-              text
-            )
-          ) {
-            score += 30;
-          }
-
-          if (
-            /Add a comment/i.test(
-              text
-            )
-          ) {
-            score += 5;
-          }
-
-          if (
-            /(auto|scroll)/.test(
-              s.overflowY
-            ) &&
-            el.scrollHeight >
-              el.clientHeight +
-                80
-          ) {
-            score += 30;
-          }
-
-          if (
-            r.right >
-            innerWidth * 0.55
-          ) {
-            score += 15;
-          }
-
-          if (
-            r.width >= 280 &&
-            r.width <= 650
-          ) {
-            score += 10;
-          }
-
-          if (
-            r.height >= 250
-          ) {
-            score += 10;
-          }
-
-          return {
-            score,
-
-            profileCount,
-
-            replyCount,
-
-            timeCount,
-
-            scrollable:
-              /(auto|scroll)/.test(
-                s.overflowY
-              ) &&
-              el.scrollHeight >
-                el.clientHeight +
-                  80,
-
-            rect: {
-              x: r.x,
-              y: r.y,
-              width:
-                r.width,
-              height:
-                r.height
-            },
-
-            scrollHeight:
-              el.scrollHeight,
-
-            clientHeight:
-              el.clientHeight,
-
-            textSample:
-              text.slice(
-                0,
-                900
-              )
-          };
-        };
-
-      const all =
-        Array.from(
-          document.querySelectorAll(
-            'body *'
-          )
-        );
-
-      const visible =
-        all.filter(
-          el => {
-            const r =
-              el.getBoundingClientRect();
-
-            const s =
-              getComputedStyle(
-                el
-              );
-
-            return (
-              s.display !==
-                'none' &&
-              s.visibility !==
-                'hidden' &&
-              r.width > 0 &&
-              r.height > 0
-            );
-          }
-        );
-
-      const dialogs =
-        visible.filter(
-          el =>
-            el.getAttribute(
-              'role'
-            ) ===
-              'dialog' &&
-            el.getBoundingClientRect()
-              .width >= 250 &&
-            el.getBoundingClientRect()
-              .height >= 250
-        );
-
-      const sources =
-        dialogs.length
-          ? dialogs
-          : visible.filter(
-              el => {
-                const r =
-                  el.getBoundingClientRect();
-
-                const s =
-                  getComputedStyle(
-                    el
-                  );
-
-                if (
-                  r.width < 250 ||
-                  r.height < 250 ||
-                  r.right <
-                    innerWidth *
-                      0.45
-                ) {
-                  return false;
-                }
-
-                if (
-                  s.position !==
-                    'fixed' &&
-                  s.position !==
-                    'absolute' &&
-                  !/(auto|scroll)/.test(
-                    s.overflowY
-                  )
-                ) {
-                  return false;
-                }
-
-                return (
-                  el.scrollHeight >
-                  el.clientHeight +
-                    80
+              const s =
+                getComputedStyle(
+                  el
                 );
-              }
-            );
 
-      const scored =
-        sources
-          .map(
-            el => ({
-              el,
-              info:
-                scoreRoot(el)
-            })
-          )
-          .sort(
-            (a, b) =>
-              b.info.score -
-              a.info.score
+              if (
+                r.width < 250 ||
+                r.height < 250 ||
+                r.right <
+                  innerWidth *
+                    0.45
+              ) {
+                return false;
+              }
+
+              if (
+                s.position !==
+                  'fixed' &&
+                s.position !==
+                  'absolute' &&
+                !/(auto|scroll)/.test(
+                  s.overflowY
+                )
+              ) {
+                return false;
+              }
+
+              return (
+                el.scrollHeight >
+                el.clientHeight +
+                  80
+              );
+            }
           );
 
-      if (
-        !scored.length
-      ) {
-        return null;
-      }
-
-      const best =
-        scored[0];
-
-      if (
-        best.info.score <
-          45 ||
-        best.info.profileCount <
-          2
-      ) {
-        return null;
-      }
-
-      const index =
-        all.indexOf(
-          best.el
+    const scored =
+      sources
+        .map(
+          el => ({
+            el,
+            info:
+              scoreRoot(el)
+          })
+        )
+        .sort(
+          (a, b) =>
+            b.info.score -
+            a.info.score
         );
 
-      return {
-        index,
-        ...best.info
-      };
+    if (
+      !scored.length
+    ) {
+      return null;
     }
-  );
-}
 
-async function getPreClickSignals(
-  page
-) {
-  return page.evaluate(
-    () => ({
-      dialogCount:
-        document.querySelectorAll(
-          '[role="dialog"]'
-        ).length,
+    const best =
+      scored[0];
 
-      commentLikeText:
-        (
-          document.body?.innerText ||
-          ''
-        ).match(
-          /Reply|View all comments|View more comments|پاسخ/gi
-        )?.length || 0,
+    if (
+      best.info.score <
+        45 ||
+      best.info.profileCount <
+        2
+    ) {
+      return null;
+    }
 
-      bodyLength:
-        (
-          document.body?.innerText ||
-          ''
-        ).length
-    })
-  );
+    const index =
+      all.indexOf(
+        best.el
+      );
+
+    return {
+      index,
+      ...best.info
+    };
+  });
 }
 
 async function waitForCommentRoot(
   page
 ) {
   const deadline =
-    Date.now() + 7000;
+    Date.now() +
+    7000;
 
   while (
     Date.now() <
@@ -1181,52 +1141,7 @@ async function getRootLocator(
   return locator;
 }
 
-async function verifyCommentOpened(
-  page
-) {
-  const before =
-    await getPreClickSignals(
-      page
-    );
-
-  await clickRealCommentButton(
-    page
-  );
-
-  const descriptor =
-    await waitForCommentRoot(
-      page
-    );
-
-  if (!descriptor) {
-    appendLog(
-      'COMMENT_UI_VERIFICATION_FAILED',
-      {
-        before
-      }
-    );
-
-    throw new Error(
-      'COMMENT_UI_DID_NOT_OPEN_AS_A_REAL_COMMENT_LIST'
-    );
-  }
-
-  appendLog(
-    'COMMENT_ROOT_FOUND',
-    descriptor
-  );
-
-  await markCommentRoot(
-    page,
-    descriptor
-  );
-
-  return getRootLocator(
-    page
-  );
-}
-
-/* ------------------------ COMMENT EXTRACTION ------------------------ */
+/* ------------------------ EXTRACTION ------------------------ */
 
 async function extractVisibleComments(
   root
@@ -1278,7 +1193,7 @@ async function extractVisibleComments(
             )
             .trim();
 
-      const isProfileHref =
+      const validProfileHref =
         href =>
           /^\/[^/]+\/?$/.test(
             href || ''
@@ -1297,7 +1212,7 @@ async function extractVisibleComments(
           )
         ).filter(
           a =>
-            isProfileHref(
+            validProfileHref(
               a.getAttribute(
                 'href'
               )
@@ -1333,8 +1248,11 @@ async function extractVisibleComments(
             username
           );
 
-        let row = null;
-        let node = link;
+        let row =
+          null;
+
+        let node =
+          link;
 
         for (
           let level = 0;
@@ -1438,7 +1356,9 @@ async function extractVisibleComments(
                 !n ||
                 n ===
                   normalizedUsername ||
-                ignored.test(n)
+                ignored.test(
+                  n
+                )
               ) {
                 return false;
               }
@@ -1488,12 +1408,16 @@ async function extractVisibleComments(
           )}`;
 
         if (
-          seen.has(key)
+          seen.has(
+            key
+          )
         ) {
           continue;
         }
 
-        seen.add(key);
+        seen.add(
+          key
+        );
 
         out.push({
           key,
@@ -1757,7 +1681,7 @@ async function collectAllComments(
   );
 }
 
-/* ------------------------ MATCH LOCATOR / REPLY ------------------------ */
+/* ------------------------ FIND MATCHED COMMENT ------------------------ */
 
 async function findCommentRow(
   root,
@@ -1912,7 +1836,9 @@ async function findCommentRow(
     const element =
       handle.asElement();
 
-    if (element) {
+    if (
+      element
+    ) {
       return element;
     }
 
@@ -1945,6 +1871,8 @@ async function findCommentRow(
     'COMMENT_ROW_NOT_FOUND_FOR_MATCH'
   );
 }
+
+/* ------------------------ REPLY ------------------------ */
 
 async function sendReply(
   page,
@@ -2031,7 +1959,8 @@ async function sendReply(
   let input = null;
 
   for (
-    const candidate of inputs
+    const candidate of
+    inputs
   ) {
     if (
       await candidate
@@ -2240,7 +2169,8 @@ async function sendDM(
   let input = null;
 
   for (
-    const candidate of inputs
+    const candidate of
+    inputs
   ) {
     if (
       await candidate
@@ -2340,9 +2270,7 @@ async function processPost(
 ) {
   const postLog = {
     postIndex,
-
     url,
-
     startedAt:
       now(),
 
@@ -2395,13 +2323,17 @@ async function processPost(
     page
   );
 
-  const beforeRootCandidates =
-    await getCommentRootDescriptor(
-      page
-    );
-
+  /*
+   * IMPORTANT:
+   * This is the actual function defined above.
+   *
+   * The previous broken version called:
+   * clickActualCommentButton()
+   *
+   * which did not exist.
+   */
   const clickInfo =
-    await clickActualCommentButton(
+    await clickRealCommentButton(
       page
     );
 
@@ -2412,10 +2344,7 @@ async function processPost(
     'COMMENT_CLICKED',
     {
       strategy:
-        clickInfo.strategy,
-
-      beforeRoot:
-        beforeRootCandidates
+        clickInfo.strategy
     }
   );
 
@@ -2478,7 +2407,7 @@ async function processPost(
   );
 
   /*
-   * Scan the entire comment list.
+   * Scan complete comments list.
    */
   const comments =
     await collectAllComments(
@@ -2505,14 +2434,18 @@ async function processPost(
     );
   }
 
-  const matchList =
+  /*
+   * Find every match.
+   */
+  const matches =
     [];
 
   const processed =
     new Set();
 
   for (
-    const comment of comments
+    const comment of
+    comments
   ) {
     const match =
       keywordMatch(
@@ -2539,14 +2472,14 @@ async function processPost(
 
     processed.add(key);
 
-    matchList.push({
+    matches.push({
       comment,
       match
     });
   }
 
   postLog.matchesFound =
-    matchList.length;
+    matches.length;
 
   appendLog(
     'MATCH_SCAN_COMPLETE',
@@ -2555,7 +2488,7 @@ async function processPost(
         comments.length,
 
       matches:
-        matchList.length
+        matches.length
     }
   );
 
@@ -2566,7 +2499,7 @@ async function processPost(
     const {
       comment,
       match
-    } of matchList
+    } of matches
   ) {
     const item = {
       username:
@@ -2622,7 +2555,10 @@ async function processPost(
         'REPLY_SENT',
         {
           username:
-            comment.username
+            comment.username,
+
+          keyword:
+            match.keyword
         }
       );
 
@@ -2766,9 +2702,17 @@ async function main() {
       }
     });
 
+  /*
+   * Page 1:
+   * Post + Comment List
+   */
   const page =
     await context.newPage();
 
+  /*
+   * Page 2:
+   * Direct Message
+   */
   const dmPage =
     await context.newPage();
 
@@ -2777,7 +2721,6 @@ async function main() {
       now(),
 
     keywords,
-
     postUrls,
 
     config: {
@@ -2785,7 +2728,7 @@ async function main() {
         'Instagram Web Desktop',
 
       commentStrategy:
-        'real post action-bar Comment icon -> verified comment root',
+        'real post action-bar Comment button',
 
       maxScanRounds:
         MAX_SCAN_ROUNDS,
@@ -2803,11 +2746,8 @@ async function main() {
         1
     },
 
-    posts:
-      [],
-
-    errors:
-      []
+    posts: [],
+    errors: []
   };
 
   try {

@@ -951,8 +951,16 @@ async function saveFailureScreenshot(page, postLog, stage, error) {
 }
 
 async function findCommentRow(root, target, page) {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const handle = await root.evaluateHandle((rootEl, targetComment) => {
+  const targetUsername = normalizeText(target?.username || '');
+  const targetCommentText = normalizeText(target?.commentText || '');
+  const targetProfilePath = String(target?.profilePath || '').trim();
+
+  if (!targetUsername || !targetCommentText) {
+    throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
+  }
+
+  const findInCurrentDom = async () => {
+    const handle = await root.evaluateHandle((rootEl, targetData) => {
       const normalize = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -967,99 +975,255 @@ async function findCommentRow(root, target, page) {
         .replace(/\s+/g, ' ')
         .trim();
 
+      const compact = value => normalize(value).replace(/\s+/g, '');
+
       const validProfileHref = href => {
-        const v = String(href || '');
-        if (!/^\/[^/]+\/?$/.test(v)) return false;
-        return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(v);
+        const value = String(href || '');
+        if (!/^\/[^/]+\/?$/.test(value)) return false;
+        return !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(value);
       };
 
-      const profileCountFor = el => Array.from(el.querySelectorAll('a[href^="/"]'))
-        .filter(a => validProfileHref(a.getAttribute('href'))).length;
-
-      const isNoiseLine = line => {
-        const t = normalize(line);
-        if (!t) return true;
-        if (/^(reply|like|likes?)$/i.test(t)) return true;
-        if (/^(add a comment|view insights|boost post|send message|message|send|post|cancel|close|ok|got it)$/i.test(t)) return true;
-        if (/^(view all \d+ replies|view hidden comments|load more comments|view more comments|view all comments)$/i.test(t)) return true;
-        if (/^\d+([smhdw])$/i.test(t)) return true;
-        if (/^\d+([,.]\d+)*$/.test(t)) return true;
-        if (/^\d{1,2}:\d{2}$/.test(t)) return true;
-        return false;
+      const isVisible = element => {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          rect.width > 0 &&
+          rect.height > 0 &&
+          rect.right > 0 &&
+          rect.bottom > 0 &&
+          rect.left < innerWidth &&
+          rect.top < innerHeight
+        );
       };
 
-      const targetUsername = normalize(targetComment.username);
-      const targetCommentText = normalize(targetComment.commentText);
-      const targetProfilePath = targetComment.profilePath || '';
+      const hasTimestampSignal = element => {
+        if (element.querySelector('time')) return true;
 
-      const scoreRow = row => {
-        const txt = normalize(row.innerText || '');
-        if (!txt || txt.length > 1200) return null;
-        if (!txt.includes(targetUsername) || !txt.includes(targetCommentText)) return null;
+        const lines = String(element.innerText || '')
+          .split(/\n+/)
+          .map(line => normalize(line))
+          .filter(Boolean);
 
-        const profileLinks = Array.from(row.querySelectorAll('a[href^="/"]'))
+        return lines.some(line =>
+          /^\d+\s*(s|m|h|d|w|mo|y)$/i.test(line) ||
+          /^\d+\s*(ثانیه|دقیقه|ساعت|روز|هفته|ماه|سال)$/i.test(line) ||
+          /^\d{1,2}:\d{2}$/.test(line)
+        );
+      };
+
+      const isUiOnlyText = value => {
+        const line = normalize(value);
+        return (
+          /^(reply|پاسخ|like|likes?|پسندیدن|send|ارسال|post|پست)$/i.test(line) ||
+          /^view all \d+ replies$/i.test(line) ||
+          /^view hidden comments$/i.test(line) ||
+          /^add a comment$/i.test(line)
+        );
+      };
+
+      const scoreCandidate = (element, profileLink) => {
+        if (!isVisible(element)) return null;
+
+        const text = String(element.innerText || '').trim();
+        const normalizedText = normalize(text);
+
+        if (!normalizedText) return null;
+        if (text.length > 900) return null;
+
+        const profileLinks = Array.from(element.querySelectorAll('a[href^="/"]'))
           .filter(a => validProfileHref(a.getAttribute('href')));
+
         if (profileLinks.length !== 1) return null;
 
-        const profileLink = profileLinks[0];
-        if (targetProfilePath && (profileLink.getAttribute('href') || '') !== targetProfilePath) return null;
+        const actualProfilePath = profileLinks[0].getAttribute('href') || '';
+        if (targetData.profilePath && actualProfilePath !== targetData.profilePath) return null;
 
-        const timeCount = row.querySelectorAll('time').length;
-        const lineCount = (row.innerText || '').split(/\n+/).map(x => x.trim()).filter(Boolean).length;
-        if (timeCount < 1 || lineCount < 2 || lineCount > 15) return null;
+        if (profileLink && profileLinks[0] !== profileLink) return null;
 
-        const hasSignals = row.querySelector('time') || /\bReply\b|پاسخ/i.test(txt) || row.querySelector('button,[role="button"]');
-        if (!hasSignals) return null;
+        if (!normalizedText.includes(targetData.username)) return null;
+        if (
+          !normalizedText.includes(targetData.commentText) &&
+          !compact(normalizedText).includes(compact(targetData.commentText))
+        ) {
+          return null;
+        }
 
-        let score = 0;
-        score += row.querySelector('time') ? 20 : 0;
-        score += /\bReply\b|پاسخ/i.test(txt) ? 18 : 0;
-        score += row.querySelector('button,[role="button"]') ? 10 : 0;
-        score += Math.max(0, 60 - txt.length / 18);
-        score -= isNoiseLine(txt) ? 30 : 0;
-        return { row, score };
+        const lines = text
+          .split(/\n+/)
+          .map(line => line.trim())
+          .filter(Boolean);
+
+        if (lines.length < 2 || lines.length > 15) return null;
+        if (!hasTimestampSignal(element)) return null;
+
+        const rect = element.getBoundingClientRect();
+        const sizeScore = Math.max(
+          0,
+          70 - Math.min(70, Math.floor((rect.width * rect.height) / 6000))
+        );
+
+        let score = 180;
+        score += element.querySelector('time') ? 45 : 0;
+        score += Array.from(
+          element.querySelectorAll('button,[role="button"],a')
+        ).some(node => {
+          const label = normalize(
+            `${node.innerText || ''} ${node.getAttribute('aria-label') || ''} ${node.getAttribute('title') || ''}`
+          );
+          return /^(reply|پاسخ)$/i.test(label) || /^reply\b/i.test(label);
+        }) ? 35 : 0;
+        score += sizeScore;
+
+        if (isUiOnlyText(text)) score -= 60;
+
+        return {
+          element,
+          score,
+          textLength: text.length,
+          rect,
+          profilePath: actualProfilePath
+        };
       };
 
       const candidates = [];
 
-      const links = Array.from(rootEl.querySelectorAll('a[href^="/"]')).filter(a => validProfileHref(a.getAttribute('href')));
-      for (const link of links) {
-        if (normalize(link.textContent || '') !== targetUsername) continue;
-        if (targetProfilePath && (link.getAttribute('href') || '') !== targetProfilePath) continue;
+      /*
+       * Primary path:
+       * Find the exact username/profile link and walk upward. The first
+       * ancestor accepted as a row must remain a small, single-profile,
+       * timestamp-bearing subtree containing the exact comment text.
+       */
+      const profileLinks = Array.from(
+        rootEl.querySelectorAll('a[href^="/"]')
+      )
+        .filter(a => validProfileHref(a.getAttribute('href')))
+        .filter(a => normalize(a.textContent || '') === targetData.username)
+        .filter(a => !targetData.profilePath || (a.getAttribute('href') || '') === targetData.profilePath);
 
-        let node = link;
-        for (let level = 0; level < 10 && node && node !== rootEl; level++) {
+      for (const profileLink of profileLinks) {
+        let node = profileLink;
+
+        for (let depth = 0; depth < 10 && node && node !== rootEl; depth += 1) {
           node = node.parentElement;
           if (!node) break;
-          const txt = (node.innerText || '').trim();
-          if (!txt || txt.length > 1200) continue;
-          const ntext = normalize(txt);
-          if (!ntext.includes(targetUsername) || !ntext.includes(targetCommentText)) continue;
-          const scored = scoreRow(node);
-          if (scored) {
-            candidates.push(scored);
-            break;
-          }
+
+          const candidate = scoreCandidate(node, profileLink);
+          if (!candidate) continue;
+
+          candidates.push(candidate);
+          break;
         }
       }
 
+      /*
+       * Structural fallback:
+       * Used only when the profile-link path is temporarily unavailable.
+       * Large comment containers are explicitly rejected by the same
+       * single-profile + timestamp + small-subtree constraints.
+       */
       if (!candidates.length) {
-        for (const el of Array.from(rootEl.querySelectorAll('article, li, [role="article"], [data-testid], div'))) {
-          const scored = scoreRow(el);
-          if (scored) candidates.push(scored);
-        }
+        const structural = Array.from(
+          rootEl.querySelectorAll('article,li,[role="article"],[data-testid],div')
+        )
+          .map(element => scoreCandidate(element, null))
+          .filter(Boolean)
+          .sort((a, b) =>
+            b.score - a.score ||
+            a.textLength - b.textLength ||
+            a.rect.top - b.rect.top
+          );
+
+        candidates.push(...structural.slice(0, 5));
       }
 
       if (!candidates.length) return null;
-      const best = candidates.sort((a, b) => b.score - a.score || (a.row.innerText || '').length - (b.row.innerText || '').length)[0].row;
-      best.setAttribute('data-ig-target-row', '1');
-      return best;
-    }, target);
 
-    const row = handle.asElement();
+      candidates.sort((a, b) =>
+        b.score - a.score ||
+        a.textLength - b.textLength ||
+        a.rect.top - b.rect.top
+      );
+
+      const best = candidates[0];
+      const token = `comment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      best.element.setAttribute('data-ig-target-row', token);
+
+      return {
+        token,
+        profilePath: best.profilePath
+      };
+    }, {
+      username: targetUsername,
+      commentText: targetCommentText,
+      profilePath: targetProfilePath
+    });
+
+    const descriptor = await handle.jsonValue().catch(() => null);
+    await handle.dispose().catch(() => {});
+
+    if (!descriptor?.token) return null;
+
+    const safeToken = String(descriptor.token).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const row = page.locator(
+      `[data-ig-target-row="${safeToken}"]`
+    ).first();
+
+    if (!(await row.isVisible().catch(() => false))) return null;
+
+    await row.scrollIntoViewIfNeeded().catch(() => {});
+    await page.waitForTimeout(200);
+
+    return row;
+  };
+
+  /*
+   * Scan again from the top because the normal comment scanner intentionally
+   * finishes at the bottom and Instagram may virtualize rows that are no
+   * longer in the DOM. This keeps the existing scan workflow untouched while
+   * making match->row binding independent of the final scroll position.
+   */
+  await root.evaluate(el => {
+    el.scrollTop = 0;
+  }).catch(() => {});
+
+  await page.waitForTimeout(250);
+
+  for (let round = 1; round <= MAX_SCAN_ROUNDS; round += 1) {
+    const row = await findInCurrentDom();
     if (row) return row;
-    await page.waitForTimeout(350);
+
+    const moreClicked = await clickMoreComments(root);
+    if (moreClicked) {
+      await page.waitForTimeout(450);
+      const afterMore = await findInCurrentDom();
+      if (afterMore) return afterMore;
+    }
+
+    const scroll = await scrollRoot(root, SCROLL_STEP);
+    await page.waitForTimeout(Math.min(SCROLL_WAIT, 650));
+
+    if (scroll.atBottom) {
+      const finalAttempt = await findInCurrentDom();
+      if (finalAttempt) return finalAttempt;
+
+      break;
+    }
   }
+
+  /*
+   * One last top-position attempt handles a DOM recycle race where the target
+   * appeared only briefly between scroll cycles.
+   */
+  await root.evaluate(el => {
+    el.scrollTop = 0;
+  }).catch(() => {});
+  await page.waitForTimeout(250);
+
+  const finalRow = await findInCurrentDom();
+  if (finalRow) return finalRow;
 
   throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 }
@@ -1068,10 +1232,18 @@ async function findCommentRow(root, target, page) {
 async function sendReply(page, row, replyText) {
   if (!row) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
 
+  const reply = String(replyText || '').trim();
+  if (!reply) throw new Error('REPLY_NOT_CONFIRMED');
+
   await row.scrollIntoViewIfNeeded().catch(() => {});
   await page.waitForTimeout(250);
 
-  const replyTarget = await row.evaluate((rowEl) => {
+  /*
+   * Reply control is strictly row-scoped. The only fallback allowed is the
+   * nearest logical comment-thread ancestor with exactly one profile link.
+   * There is intentionally NO document-wide Reply search.
+   */
+  const replyDescriptor = await row.evaluate(rowEl => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
@@ -1086,132 +1258,278 @@ async function sendReply(page, row, replyText) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    const isVisible = el => {
-      if (!el) return false;
-      const r = el.getBoundingClientRect();
-      const s = getComputedStyle(el);
+    const isVisible = element => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
       return (
-        s.display !== 'none' &&
-        s.visibility !== 'hidden' &&
-        r.width > 0 &&
-        r.height > 0 &&
-        r.right > 0 &&
-        r.bottom > 0 &&
-        r.left < innerWidth &&
-        r.top < innerHeight
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.right > 0 &&
+        rect.bottom > 0 &&
+        rect.left < innerWidth &&
+        rect.top < innerHeight
       );
     };
 
-    const textFor = el => `${el.innerText || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''}`.trim();
-    const isReplyLabel = el => {
-      const t = normalize(textFor(el));
-      return /^(reply|پاسخ)$/i.test(t) || /\breply\b/i.test(t) || /پاسخ/i.test(t);
+    const getLabel = element => normalize(
+      `${element.innerText || ''} ${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`
+    );
+
+    const isReplyControl = element => {
+      if (!isVisible(element)) return false;
+      if (!element.matches('button,[role="button"],a')) return false;
+
+      const label = getLabel(element);
+
+      return (
+        /^(reply|پاسخ)$/i.test(label) ||
+        /^reply\b/i.test(label) ||
+        /^پاسخ\b/i.test(label)
+      );
     };
+
+    const profileCount = element => Array.from(
+      element.querySelectorAll('a[href^="/"]')
+    ).filter(a => {
+      const href = String(a.getAttribute('href') || '');
+      return (
+        /^\/[^/]+\/?$/.test(href) &&
+        !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href)
+      );
+    }).length;
 
     const rowRect = rowEl.getBoundingClientRect();
-    const collected = [];
+    const candidates = [];
 
-    const scoreCandidate = (el, source) => {
-      if (!isVisible(el) || !isReplyLabel(el)) return;
-      const r = el.getBoundingClientRect();
-      const text = normalize(textFor(el));
-      let score = 0;
-      score += /^(reply|پاسخ)$/i.test(text) ? 25 : 0;
-      score += /button|role="button"/i.test(`${el.tagName} ${el.getAttribute('role') || ''}`) ? 10 : 0;
-      score += Math.max(0, 180 - Math.abs((r.top + r.height / 2) - (rowRect.bottom + 18)));
-      score += r.left < rowRect.left + 220 ? 18 : 0;
-      score += source === 'descendant' ? 8 : 0;
-      score += source === 'ancestor' ? 4 : 0;
-      collected.push({
-        el,
-        score,
-        text,
-        source,
-        rect: {
-          left: r.left,
-          top: r.top,
-          width: r.width,
-          height: r.height,
-          centerX: r.left + r.width / 2,
-          centerY: r.top + r.height / 2
-        }
-      });
+    const collect = (scope, source) => {
+      if (!scope) return;
+
+      const scopeRect = scope.getBoundingClientRect();
+
+      for (const control of Array.from(
+        scope.querySelectorAll('button,[role="button"],a')
+      )) {
+        if (!isReplyControl(control)) continue;
+
+        const rect = control.getBoundingClientRect();
+
+        if (rect.bottom < rowRect.top - 20) continue;
+        if (rect.top > rowRect.bottom + 120) continue;
+        if (rect.right < scopeRect.left || rect.left > scopeRect.right) continue;
+
+        const verticalDistance = Math.abs(
+          rect.top - (rowRect.bottom - Math.min(12, rowRect.height * 0.1))
+        );
+
+        let score = source === 'row' ? 200 : 130;
+        score += Math.max(0, 70 - verticalDistance);
+        score += control.matches('button,[role="button"]') ? 25 : 0;
+        score += /^(reply|پاسخ)$/i.test(getLabel(control)) ? 30 : 0;
+
+        candidates.push({
+          control,
+          score,
+          source,
+          rect
+        });
+      }
     };
 
-    let scope = rowEl;
-    for (let depth = 0; depth < 5 && scope; depth++) {
-      for (const el of Array.from(scope.querySelectorAll('button,[role="button"],a,span,div'))) {
-        scoreCandidate(el, depth === 0 ? 'descendant' : 'ancestor');
+    collect(rowEl, 'row');
+
+    let scope = rowEl.parentElement;
+    for (let depth = 0; depth < 3 && scope; depth += 1) {
+      if (profileCount(scope) === 1) {
+        const rect = scope.getBoundingClientRect();
+        if (rect.width <= 1200 && rect.height <= 900) {
+          collect(scope, 'ancestor');
+        }
       }
+
       scope = scope.parentElement;
     }
 
-    if (!collected.length) {
-      for (const el of Array.from(document.querySelectorAll('button,[role="button"],a,span,div'))) {
-        if (!isVisible(el) || !isReplyLabel(el)) continue;
-        const r = el.getBoundingClientRect();
-        if (r.bottom < rowRect.top - 40 || r.top > rowRect.bottom + 240) continue;
-        scoreCandidate(el, 'global');
-      }
-    }
+    if (!candidates.length) return null;
 
-    if (!collected.length) return null;
-    collected.sort((a, b) => b.score - a.score || a.rect.top - b.rect.top || a.rect.left - b.rect.left);
-    const best = collected[0];
-    best.el.setAttribute('data-ig-reply-target', '1');
+    candidates.sort((a, b) =>
+      b.score - a.score ||
+      a.rect.top - b.rect.top ||
+      a.rect.left - b.rect.left
+    );
+
+    const best = candidates[0];
+    const token = `reply-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.control.setAttribute('data-ig-reply-target', token);
+
     return {
-      score: best.score,
+      token,
       source: best.source,
-      text: best.text,
-      rect: best.rect
+      score: best.score
     };
   });
 
-  if (!replyTarget) throw new Error('REPLY_BUTTON_NOT_FOUND');
+  if (!replyDescriptor?.token) {
+    throw new Error('REPLY_BUTTON_NOT_FOUND');
+  }
 
-  const replyLocator = page.locator('[data-ig-reply-target="1"]').last();
-  await replyLocator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async () => {
-    await replyLocator.evaluate(el => el.click()).catch(() => {});
+  const safeReplyToken = String(replyDescriptor.token)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+
+  const replyLocator = page
+    .locator(`[data-ig-reply-target="${safeReplyToken}"]`)
+    .first();
+
+  if (!(await replyLocator.isVisible().catch(() => false))) {
+    throw new Error('REPLY_BUTTON_NOT_FOUND');
+  }
+
+  await replyLocator.scrollIntoViewIfNeeded().catch(() => {});
+
+  if (!(await safeClick(replyLocator, CLICK_TIMEOUT_MS))) {
+    await replyLocator.evaluate(element => {
+      if (element instanceof HTMLElement) {
+        element.click();
+        return;
+      }
+
+      element.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      }));
+    }).catch(() => {});
+  }
+
+  /*
+   * Do not treat a successful DOM click as a successful Reply operation.
+   * We need a visible reply composer.
+   */
+  await page.waitForTimeout(450);
+
+  const composerDescriptor = await page.evaluate(() => {
+    const visible = element => {
+      if (!element) return false;
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return (
+        style.display !== 'none' &&
+        style.visibility !== 'hidden' &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        rect.right > 0 &&
+        rect.bottom > 0
+      );
+    };
+
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const inputs = Array.from(
+      document.querySelectorAll('textarea,[contenteditable="true"]')
+    ).filter(visible);
+
+    if (!inputs.length) return null;
+
+    const active = document.activeElement;
+    const candidates = inputs.map((element, index) => {
+      const rect = element.getBoundingClientRect();
+      const placeholder = normalize(
+        `${element.getAttribute('placeholder') || ''} ${element.getAttribute('aria-label') || ''}`
+      );
+
+      let score = 0;
+      if (element === active) score += 100;
+      if (/reply|پاسخ/i.test(placeholder)) score += 100;
+      if (/add a comment|نظر|comment/i.test(placeholder)) score += 15;
+      score += Math.max(0, 40 - Math.abs(rect.bottom - innerHeight));
+
+      return {
+        element,
+        index,
+        score
+      };
+    });
+
+    candidates.sort((a, b) => b.score - a.score || b.index - a.index);
+
+    const best = candidates[0];
+    if (!best || best.score < 15) return null;
+
+    const token = `composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.element.setAttribute('data-ig-reply-composer', token);
+
+    return { token };
   });
-  await page.waitForTimeout(500);
 
-  const inputs = [
-    page.getByPlaceholder(/Reply|Add a comment|پاسخ|نظر/i).last(),
-    page.locator('textarea').last(),
-    page.locator('[contenteditable="true"]').last()
-  ];
-
-  let input = null;
-  for (const candidate of inputs) {
-    if (await candidate.isVisible().catch(() => false)) {
-      input = candidate;
-      break;
-    }
+  if (!composerDescriptor?.token) {
+    throw new Error('REPLY_UI_NOT_OPENED');
   }
 
-  if (!input) throw new Error('REPLY_INPUT_NOT_FOUND');
+  const composerToken = String(composerDescriptor.token)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
 
-  if (await input.fill(replyText).catch(() => false) === false) {
+  const input = page
+    .locator(`[data-ig-reply-composer="${composerToken}"]`)
+    .first();
+
+  if (!(await input.isVisible().catch(() => false))) {
+    throw new Error('REPLY_UI_NOT_OPENED');
+  }
+
+  const fillSucceeded = await input.fill(reply).then(
+    () => true,
+    () => false
+  );
+
+  if (!fillSucceeded) {
     await input.click();
-    await input.pressSequentially(replyText);
+    await input.pressSequentially(reply, { delay: 15 });
   }
 
-  const sendButton = page.getByRole('button', { name: /Send|Post|ارسال|پست/i }).last();
-  if (!(await safeClick(sendButton, 2500))) {
+  const entered = await input
+    .inputValue()
+    .catch(async () => await input.textContent().catch(() => ''));
+
+  if (!String(entered || '').trim()) {
+    throw new Error('REPLY_UI_NOT_OPENED');
+  }
+
+  const sendButton = page.getByRole('button', {
+    name: /Send|Post|ارسال|پست/i
+  }).last();
+
+  let sentByButton = await safeClick(sendButton, 2500);
+
+  if (!sentByButton) {
     await input.press('Enter');
   }
 
   await page.waitForTimeout(900);
 
-  const stillThere = await input.inputValue().catch(() => '');
-  if (String(stillThere).trim()) {
-    await input.press('Enter');
-    await page.waitForTimeout(700);
-  }
+  const normalizedReply = normalizeText(reply);
 
-  const normalizedReply = normalizeText(replyText);
+  /*
+   * Verification is intentionally tied to the original comment row/thread.
+   * "composer is empty" alone is NOT success.
+   */
   const verified = await page.waitForFunction(
-    ({ selector, normalizedReplyText }) => {
+    ({ rowSelector, replyText }) => {
       const normalize = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -1225,16 +1543,50 @@ async function sendReply(page, row, replyText) {
         .replace(/ؤ/g, 'و')
         .replace(/\s+/g, ' ')
         .trim();
-      const node = document.querySelector(selector);
-      if (!node) return false;
-      const text = normalize(node.innerText || '');
-      const inputs = Array.from(node.querySelectorAll('textarea,[contenteditable="true"]'));
-      const inputCleared = inputs.every(el => !(String(el.value || el.textContent || '').trim()));
-      return text.includes(normalizedReplyText) || inputCleared;
+
+      const row = document.querySelector(rowSelector);
+      if (!row) return false;
+
+      const normalizedTargetReply = normalize(replyText);
+      const containsReply = element =>
+        normalize(element.innerText || '').includes(normalizedTargetReply);
+
+      if (containsReply(row)) return true;
+
+      /*
+       * Instagram may render a reply as a sibling under a logical thread
+       * wrapper instead of as a child of the original comment row.
+       */
+      let scope = row.parentElement;
+
+      for (let depth = 0; depth < 3 && scope; depth += 1) {
+        const profileLinks = Array.from(
+          scope.querySelectorAll('a[href^="/"]')
+        ).filter(a => {
+          const href = String(a.getAttribute('href') || '');
+          return (
+            /^\/[^/]+\/?$/.test(href) &&
+            !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(href)
+          );
+        });
+
+        if (profileLinks.length >= 1 && containsReply(scope)) {
+          return true;
+        }
+
+        scope = scope.parentElement;
+      }
+
+      return false;
     },
-    { selector: '[data-ig-target-row="1"]', normalizedReplyText: normalizedReply },
-    { timeout: 6000 }
-  ).then(() => true).catch(() => false);
+    {
+      rowSelector: `[data-ig-target-row="${String(
+        await row.getAttribute('data-ig-target-row')
+      ).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`,
+      replyText: normalizedReply
+    },
+    { timeout: 7000 }
+  ).catch(() => false);
 
   if (!verified) {
     throw new Error('REPLY_NOT_CONFIRMED');
@@ -1242,34 +1594,84 @@ async function sendReply(page, row, replyText) {
 }
 
 
-
 async function sendDM(dmPage, profilePath, username, message) {
-  const origin = new URL(dmPage.url()).origin;
-  await dmPage.goto(new URL(profilePath, origin).href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const rawProfilePath = String(profilePath || '').trim();
+
+  let profileUrl;
+
+  try {
+    if (/^https?:\/\//i.test(rawProfilePath)) {
+      const parsed = new URL(rawProfilePath);
+
+      if (
+        parsed.hostname !== 'instagram.com' &&
+        !parsed.hostname.endsWith('.instagram.com')
+      ) {
+        throw new Error('invalid-host');
+      }
+
+      profileUrl = parsed.href;
+    } else {
+      const normalizedPath = rawProfilePath.startsWith('/')
+        ? rawProfilePath
+        : `/${rawProfilePath}`;
+
+      profileUrl = new URL(
+        normalizedPath,
+        'https://www.instagram.com'
+      ).href;
+    }
+  } catch {
+    throw new Error(`INVALID_PROFILE_URL:${username}`);
+  }
+
+  await dmPage.goto(profileUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 30000
+  });
+
   await dmPage.waitForTimeout(1000);
   await dismissCommonPopups(dmPage);
 
-  let opened = await safeClick(dmPage.getByRole('button', { name: /Message|Send message|پیام/i }).first(), 3500);
+  let opened = await safeClick(
+    dmPage.getByRole('button', {
+      name: /Message|Send message|پیام|ارسال پیام/i
+    }).first(),
+    3500
+  );
+
   if (!opened) {
-    const more = dmPage.getByLabel(/More options|گزینه‌های بیشتر/i).first();
-    if (await more.isVisible().catch(() => false)) {
-      await safeClick(more, 2000);
+    const moreButton = dmPage.getByRole('button', {
+      name: /More options|گزینه‌های بیشتر/i
+    }).first();
+
+    if (await moreButton.isVisible().catch(() => false)) {
+      await safeClick(moreButton, 2000);
       await dmPage.waitForTimeout(400);
-      opened = await safeClick(dmPage.getByText(/Message|Send message|پیام/i).first(), 3000);
+
+      opened = await safeClick(
+        dmPage.getByText(
+          /^(Message|Send message|پیام|ارسال پیام)$/i
+        ).first(),
+        3000
+      );
     }
   }
 
-  if (!opened) throw new Error(`MESSAGE_BUTTON_NOT_FOUND:${username}`);
+  if (!opened) {
+    throw new Error(`MESSAGE_BUTTON_NOT_FOUND:${username}`);
+  }
+
   await dmPage.waitForTimeout(700);
 
   const inputs = [
-    dmPage.getByPlaceholder(/Message/i).last(),
-    dmPage.getByPlaceholder(/پیام/i).last(),
+    dmPage.getByPlaceholder(/Message|پیام/i).last(),
     dmPage.locator('textarea').last(),
     dmPage.locator('[contenteditable="true"]').last()
   ];
 
   let input = null;
+
   for (const candidate of inputs) {
     if (await candidate.isVisible().catch(() => false)) {
       input = candidate;
@@ -1277,30 +1679,87 @@ async function sendDM(dmPage, profilePath, username, message) {
     }
   }
 
-  if (!input) throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
-
-  if (await input.fill(message).catch(() => false) === false) {
-    await input.click();
-    await input.pressSequentially(message);
+  if (!input) {
+    throw new Error(`DM_INPUT_NOT_FOUND:${username}`);
   }
 
-  const button = dmPage.getByRole('button', { name: /Send|ارسال/i }).last();
-  if (!(await safeClick(button, 2500))) {
+  const messageText = String(message || '').trim();
+  if (!messageText) {
+    throw new Error(`DM_NOT_CONFIRMED:${username}`);
+  }
+
+  /*
+   * Count existing occurrences before sending so a pre-existing identical
+   * message cannot by itself satisfy verification.
+   */
+  const normalizedMessage = normalizeText(messageText);
+  const beforeCount = await dmPage.evaluate(messageValue => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const body = normalize(document.body.innerText || '');
+    const needle = normalize(messageValue);
+
+    if (!needle) return 0;
+
+    let count = 0;
+    let offset = 0;
+
+    while (true) {
+      const index = body.indexOf(needle, offset);
+      if (index === -1) break;
+      count += 1;
+      offset = index + needle.length;
+    }
+
+    return count;
+  }, normalizedMessage);
+
+  const filled = await input.fill(messageText).then(
+    () => true,
+    () => false
+  );
+
+  if (!filled) {
+    await input.click();
+    await input.pressSequentially(messageText, { delay: 15 });
+  }
+
+  const sendButton = dmPage.getByRole('button', {
+    name: /Send|ارسال/i
+  }).last();
+
+  if (!(await safeClick(sendButton, 2500))) {
     await input.press('Enter');
   }
 
   await dmPage.waitForTimeout(900);
 
-  let value = await input.inputValue().catch(() => '');
-  if (String(value).trim()) {
+  let inputValue = await input
+    .inputValue()
+    .catch(() => input.textContent().catch(() => ''));
+
+  if (String(inputValue || '').trim()) {
     await input.press('Enter');
     await dmPage.waitForTimeout(800);
-    value = await input.inputValue().catch(() => '');
+    inputValue = await input
+      .inputValue()
+      .catch(() => input.textContent().catch(() => ''));
   }
 
-  const messageText = normalizeText(message);
   const verified = await dmPage.waitForFunction(
-    ({ normalizedMessage }) => {
+    ({ messageValue, originalCount }) => {
       const normalize = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -1314,16 +1773,44 @@ async function sendDM(dmPage, profilePath, username, message) {
         .replace(/ؤ/g, 'و')
         .replace(/\s+/g, ' ')
         .trim();
-      const text = normalize(document.body.innerText || '');
-      const inputCleared = !Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).some(el => String(el.value || el.textContent || '').trim());
-      return text.includes(normalizedMessage) || inputCleared;
-    },
-    { normalizedMessage: messageText },
-    { timeout: 6000 }
-  ).then(() => true).catch(() => false);
 
-  if (!verified) throw new Error(`DM_NOT_CONFIRMED:${username}`);
+      const body = normalize(document.body.innerText || '');
+      const needle = normalize(messageValue);
+
+      if (!needle) return false;
+
+      let count = 0;
+      let offset = 0;
+
+      while (true) {
+        const index = body.indexOf(needle, offset);
+        if (index === -1) break;
+        count += 1;
+        offset = index + needle.length;
+      }
+
+      const inputs = Array.from(
+        document.querySelectorAll('textarea,[contenteditable="true"]')
+      );
+
+      const anyInputStillFilled = inputs.some(element =>
+        String(element.value || element.textContent || '').trim()
+      );
+
+      return count > originalCount && !anyInputStillFilled;
+    },
+    {
+      messageValue: normalizedMessage,
+      originalCount: beforeCount
+    },
+    { timeout: 7000 }
+  ).catch(() => false);
+
+  if (!verified) {
+    throw new Error(`DM_NOT_CONFIRMED:${username}`);
+  }
 }
+
 
 async function processPost(page, dmPage, url, keywords, commentReply, dmReply, postIndex) {
   const postLog = {
@@ -1401,23 +1888,106 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
 
       appendLog('MATCH_FOUND', { url, username: comment.username, keyword: match.keyword, matchMode: match.mode, distance: match.distance });
 
-      try {
-        const row = await findCommentRow(root, comment, page);
-        await sendReply(page, row, commentReply);
-        item.reply = 'sent';
-        appendLog('REPLY_SENT', { url, username: comment.username, keyword: match.keyword });
+      let failurePage = page;
+      let failureStage = 'comment-row';
 
-        await sendDM(dmPage, comment.profilePath, comment.username, dmReply);
+      try {
+        appendLog('REPLY_ATTEMPT', {
+          url,
+          username: comment.username,
+          keyword: match.keyword
+        });
+
+        const row = await findCommentRow(root, comment, page);
+        failurePage = page;
+        failureStage = 'reply';
+
+        await sendReply(page, row, commentReply);
+
+        item.reply = 'sent';
+        appendLog('REPLY_SENT', {
+          url,
+          username: comment.username,
+          keyword: match.keyword
+        });
+
+        /*
+         * Do not trust the profile path captured during the initial scan.
+         * Re-read it from the exact comment row that received the reply.
+         */
+        const profilePathFromRow = await row.evaluate(rowEl => {
+          const validProfileHref = href => {
+            const value = String(href || '');
+            return (
+              /^\/[^/]+\/?$/.test(value) &&
+              !/^\/(explore|reels|reel|direct|accounts|stories|p|about|legal|privacy|help|api)\b/i.test(value)
+            );
+          };
+
+          const links = Array.from(
+            rowEl.querySelectorAll('a[href^="/"]')
+          ).filter(link => validProfileHref(link.getAttribute('href')));
+
+          if (links.length !== 1) return null;
+          return links[0].getAttribute('href') || null;
+        }).catch(() => null);
+
+        if (!profilePathFromRow) {
+          throw new Error('COMMENT_PROFILE_NOT_FOUND');
+        }
+
+        item.profile = profilePathFromRow;
+
+        appendLog('DM_ATTEMPT', {
+          url,
+          username: comment.username,
+          profile: profilePathFromRow
+        });
+
+        failurePage = dmPage;
+        failureStage = 'dm';
+
+        await sendDM(
+          dmPage,
+          profilePathFromRow,
+          comment.username,
+          dmReply
+        );
+
         item.dm = 'sent';
         item.status = 'done';
         postLog.matchesCompleted++;
-        appendLog('DM_SENT', { url, username: comment.username });
-        appendLog('MATCH_COMPLETED', { url, username: comment.username, keyword: match.keyword });
+
+        appendLog('DM_SENT', {
+          url,
+          username: comment.username,
+          profile: profilePathFromRow
+        });
+
+        appendLog('MATCH_COMPLETED', {
+          url,
+          username: comment.username,
+          keyword: match.keyword
+        });
       } catch (error) {
         item.status = 'error';
         item.error = String(error?.message || error);
         postLog.matchesFailed++;
-        appendLog('MATCH_FAILED', { url, username: comment.username, comment: comment.commentText, error: item.error });
+
+        await saveFailureScreenshot(
+          failurePage,
+          postLog,
+          failureStage,
+          error
+        );
+
+        appendLog('MATCH_FAILED', {
+          url,
+          username: comment.username,
+          comment: comment.commentText,
+          error: item.error,
+          failureStage
+        });
       }
 
       postLog.matchItems.push(item);

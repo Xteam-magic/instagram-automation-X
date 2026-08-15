@@ -8,19 +8,19 @@ fs.mkdirSync(ARTIFACTS, { recursive: true });
 const env = process.env;
 
 const MAX_SCAN_ROUNDS = Number(
-  env.INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS || 120
+  env.INSTAGRAM_MAX_COMMENT_SCAN_ROUNDS || 150
 );
 
-const COMMENT_SCROLL_STEP = Number(
-  env.INSTAGRAM_COMMENT_SCROLL_PIXELS || 500
+const SCROLL_STEP = Number(
+  env.INSTAGRAM_COMMENT_SCROLL_PIXELS || 550
 );
 
-const COMMENT_SCROLL_WAIT = Number(
+const SCROLL_WAIT = Number(
   env.INSTAGRAM_COMMENT_SCROLL_WAIT_MS || 900
 );
 
-const COMMENT_PANEL_WAIT = Number(
-  env.INSTAGRAM_COMMENT_PANEL_WAIT_MS || 1200
+const END_STABLE_ROUNDS = Number(
+  env.INSTAGRAM_COMMENT_END_STABLE_ROUNDS || 4
 );
 
 function now() {
@@ -29,7 +29,6 @@ function now() {
 
 function required(name) {
   const value = env[name]?.trim();
-
   if (!value) {
     throw new Error(
       `Missing required input: ${name}`
@@ -42,7 +41,7 @@ function required(name) {
 function parseList(value) {
   return String(value || '')
     .split(/\r?\n|,|،/)
-    .map(x => x.trim())
+    .map(s => s.trim())
     .filter(Boolean);
 }
 
@@ -67,26 +66,43 @@ function compactText(value) {
     .replace(/\s+/g, '');
 }
 
-function distance(a, b) {
+function levenshtein(a, b) {
   if (a === b) return 0;
   if (!a) return b.length;
   if (!b) return a.length;
 
   let prev = Array.from(
-    { length: b.length + 1 },
+    {
+      length:
+        b.length + 1
+    },
     (_, i) => i
   );
 
-  for (let i = 1; i <= a.length; i++) {
+  for (
+    let i = 1;
+    i <= a.length;
+    i++
+  ) {
     const cur = [i];
 
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(
-        cur[j - 1] + 1,
-        prev[j] + 1,
-        prev[j - 1] +
-          (a[i - 1] === b[j - 1] ? 0 : 1)
-      );
+    for (
+      let j = 1;
+      j <= b.length;
+      j++
+    ) {
+      cur[j] =
+        Math.min(
+          cur[j - 1] + 1,
+          prev[j] + 1,
+          prev[j - 1] +
+            (
+              a[i - 1] ===
+              b[j - 1]
+                ? 0
+                : 1
+            )
+        );
     }
 
     prev = cur;
@@ -105,49 +121,55 @@ function typoThreshold(word) {
 
   return Math.max(
     3,
-    Math.floor(n * 0.25)
+    Math.floor(n * 0.24)
   );
 }
 
-function keywordMatch(text, keywords) {
-  const normalized = normalizeText(text);
-  const compact = compactText(text);
+function keywordMatch(
+  text,
+  keywords
+) {
+  const normalized =
+    normalizeText(text);
+
+  const compact =
+    compactText(text);
 
   const words =
     normalized
       .split(/\s+/)
       .filter(Boolean);
 
-  for (const rawKeyword of keywords) {
+  for (
+    const raw of keywords
+  ) {
     const keyword =
-      normalizeText(rawKeyword);
+      normalizeText(raw);
 
-    if (!keyword) continue;
-
-    const keywordCompact =
-      compactText(keyword);
+    if (!keyword) {
+      continue;
+    }
 
     /*
-     * Exact match anywhere in the comment.
-     *
-     * Example:
-     * تبریک
-     * خیلی تبریک میگم
-     * تبریک بابت موفقیت
+     * Exact anywhere in comment.
      */
     if (
-      normalized.includes(keyword) ||
-      compact.includes(keywordCompact)
+      normalized.includes(
+        keyword
+      ) ||
+      compact.includes(
+        compactText(keyword)
+      )
     ) {
       return {
         matched: true,
-        keyword: rawKeyword,
+        keyword: raw,
         mode: 'exact',
         distance: 0
       };
     }
 
-    const targetWords =
+    const targets =
       keyword
         .split(/\s+/)
         .filter(Boolean);
@@ -155,27 +177,39 @@ function keywordMatch(text, keywords) {
     /*
      * Single word fuzzy.
      */
-    if (targetWords.length === 1) {
+    if (
+      targets.length === 1
+    ) {
       const target =
-        targetWords[0];
+        targets[0];
 
       const threshold =
-        typoThreshold(target);
+        typoThreshold(
+          target
+        );
 
-      for (const word of words) {
+      for (
+        const word of words
+      ) {
         if (
+          threshold > 0 &&
           Math.abs(
             word.length -
               target.length
-          ) <= threshold
+          ) <=
+            threshold
         ) {
           if (
-            word.includes(target) ||
-            target.includes(word)
+            word.includes(
+              target
+            ) ||
+            target.includes(
+              word
+            )
           ) {
             return {
               matched: true,
-              keyword: rawKeyword,
+              keyword: raw,
               mode:
                 'substring-typo',
               distance:
@@ -187,19 +221,22 @@ function keywordMatch(text, keywords) {
           }
         }
 
-        if (threshold > 0) {
+        if (
+          threshold > 0
+        ) {
           const d =
-            distance(
+            levenshtein(
               word,
               target
             );
 
           if (
-            d <= threshold
+            d <=
+            threshold
           ) {
             return {
               matched: true,
-              keyword: rawKeyword,
+              keyword: raw,
               mode: 'typo',
               distance: d
             };
@@ -217,22 +254,24 @@ function keywordMatch(text, keywords) {
       let start = 0;
       start <=
         words.length -
-          targetWords.length;
+          targets.length;
       start++
     ) {
       let ok = true;
-      let totalDistance = 0;
+      let total = 0;
 
       for (
         let i = 0;
-        i < targetWords.length;
+        i < targets.length;
         i++
       ) {
         const word =
-          words[start + i];
+          words[
+            start + i
+          ];
 
         const target =
-          targetWords[i];
+          targets[i];
 
         if (
           word === target
@@ -241,7 +280,7 @@ function keywordMatch(text, keywords) {
         }
 
         const d =
-          distance(
+          levenshtein(
             word,
             target
           );
@@ -256,16 +295,16 @@ function keywordMatch(text, keywords) {
           break;
         }
 
-        totalDistance += d;
+        total += d;
       }
 
       if (ok) {
         return {
           matched: true,
-          keyword: rawKeyword,
-          mode: 'phrase-typo',
-          distance:
-            totalDistance
+          keyword: raw,
+          mode:
+            'phrase-typo',
+          distance: total
         };
       }
     }
@@ -322,6 +361,25 @@ function writeJson(
   );
 }
 
+async function loadSession() {
+  if (
+    !env.INSTAGRAM_SESSION_B64?.trim()
+  ) {
+    return null;
+  }
+
+  return JSON.parse(
+    Buffer
+      .from(
+        env
+          .INSTAGRAM_SESSION_B64
+          .trim(),
+        'base64'
+      )
+      .toString('utf8')
+  );
+}
+
 async function safeClick(
   locator,
   timeout = 3000
@@ -342,7 +400,7 @@ async function safeClick(
 async function dismissCommonPopups(
   page
 ) {
-  const patterns = [
+  const texts = [
     'Not now',
     'Not Now',
     'Later',
@@ -358,7 +416,7 @@ async function dismissCommonPopups(
   ];
 
   for (
-    const text of patterns
+    const text of texts
   ) {
     await safeClick(
       page.getByText(
@@ -367,27 +425,9 @@ async function dismissCommonPopups(
           exact: true
         }
       ),
-      700
+      600
     );
   }
-}
-
-async function loadSession() {
-  if (
-    !env.INSTAGRAM_SESSION_B64?.trim()
-  ) {
-    return null;
-  }
-
-  const decoded =
-    Buffer
-      .from(
-        env.INSTAGRAM_SESSION_B64.trim(),
-        'base64'
-      )
-      .toString('utf8');
-
-  return JSON.parse(decoded);
 }
 
 async function login(
@@ -414,7 +454,9 @@ async function login(
   if (
     page
       .url()
-      .includes('/accounts/login')
+      .includes(
+        '/accounts/login'
+      )
   ) {
     if (
       !env.INSTAGRAM_USERNAME ||
@@ -469,566 +511,427 @@ async function login(
   }
 
   await context.storageState({
-    path: path.join(
-      ARTIFACTS,
-      'session-after-run.json'
-    )
+    path:
+      path.join(
+        ARTIFACTS,
+        'session-after-run.json'
+      )
   });
 }
 
 /* =========================================================
-   POST ACTION BAR
+   FIND REAL COMMENT BUTTON
    ========================================================= */
 
-/**
- * جمع‌آوری تمام button-like های قابل مشاهده
- * برای پیدا کردن Action Bar واقعی پست.
- */
-async function inspectActionButtons(
+async function findCommentButton(
   page
 ) {
-  return page.evaluate(() => {
-    const vw =
-      window.innerWidth;
+  return page.evaluate(
+    () => {
+      const vw =
+        window.innerWidth;
 
-    const vh =
-      window.innerHeight;
+      const vh =
+        window.innerHeight;
 
-    const nodes =
-      Array.from(
-        document.querySelectorAll(
-          'button,[role="button"],a'
-        )
-      );
+      const nodes =
+        Array.from(
+          document.querySelectorAll(
+            'button,[role="button"],a'
+          )
+        );
 
-    return nodes
-      .map(
-        (el, index) => {
-          const rect =
-            el.getBoundingClientRect();
+      const visible =
+        nodes.filter(
+          el => {
+            const r =
+              el.getBoundingClientRect();
 
-          const style =
-            getComputedStyle(
-              el
+            const s =
+              getComputedStyle(
+                el
+              );
+
+            return (
+              s.display !==
+                'none' &&
+              s.visibility !==
+                'hidden' &&
+              r.width > 0 &&
+              r.height > 0 &&
+              r.right > 0 &&
+              r.bottom > 0 &&
+              r.left < vw &&
+              r.top < vh
             );
-
-          const svg =
-            el.querySelector(
-              'svg'
-            );
-
-          const aria =
-            el.getAttribute(
-              'aria-label'
-            ) || '';
-
-          const title =
-            el.getAttribute(
-              'title'
-            ) || '';
-
-          const text =
-            (
-              el.innerText ||
-              ''
-            ).trim();
-
-          const visible =
-            style.display !== 'none' &&
-            style.visibility !==
-              'hidden' &&
-            rect.width > 0 &&
-            rect.height > 0 &&
-            rect.right > 0 &&
-            rect.bottom > 0 &&
-            rect.left < vw &&
-            rect.top < vh;
-
-          if (!visible) {
-            return null;
           }
+        );
+
+      /*
+       * Direct semantic detection.
+       */
+      const explicit =
+        visible.find(
+          el => {
+            const label = [
+              el.getAttribute(
+                'aria-label'
+              ) || '',
+              el.getAttribute(
+                'title'
+              ) || '',
+              el.textContent || ''
+            ].join(' ');
+
+            return /(^|\s)(comment|comments|نظر|دیدگاه)(\s|$)/i.test(
+              label
+            );
+          }
+        );
+
+      if (explicit) {
+        const r =
+          explicit.getBoundingClientRect();
+
+        return {
+          strategy:
+            'explicit-label',
+
+          rect: {
+            left: r.left,
+            top: r.top,
+            width: r.width,
+            height: r.height,
+
+            centerX:
+              r.left +
+              r.width / 2,
+
+            centerY:
+              r.top +
+              r.height / 2
+          },
+
+          html:
+            explicit
+              .outerHTML
+              .slice(
+                0,
+                1600
+              )
+        };
+      }
+
+      /*
+       * Small SVG controls in post action area.
+       */
+      const iconButtons =
+        visible
+          .map(
+            el => {
+              const r =
+                el.getBoundingClientRect();
+
+              return {
+                el,
+                r,
+                svg:
+                  el.querySelector(
+                    'svg'
+                  )
+              };
+            }
+          )
+          .filter(
+            x =>
+              x.svg &&
+              x.r.width <=
+                80 &&
+              x.r.height <=
+                80 &&
+              x.r.width >=
+                20 &&
+              x.r.height >=
+                20 &&
+              x.r.left >
+                vw * 0.50 &&
+              x.r.top >
+                350 &&
+              x.r.top <
+                vh - 80
+          );
+
+      const near = (
+        a,
+        b
+      ) =>
+        Math.abs(
+          a.r.centerY -
+            b.r.centerY
+        ) < 50 ||
+        Math.abs(
+          a.r.centerX -
+            b.r.centerX
+        ) < 50;
+
+      const clusters = [];
+
+      for (
+        const item of
+        iconButtons
+      ) {
+        let cluster =
+          clusters.find(
+            c =>
+              c.some(
+                x =>
+                  near(
+                    x,
+                    item
+                  )
+              )
+          );
+
+        if (!cluster) {
+          cluster = [];
+          clusters.push(
+            cluster
+          );
+        }
+
+        cluster.push(
+          item
+        );
+      }
+
+      const usefulClusters =
+        clusters
+          .filter(
+            c =>
+              c.length >=
+              4
+          )
+          .sort(
+            (a, b) =>
+              b.length -
+              a.length
+          );
+
+      if (
+        usefulClusters.length
+      ) {
+        let c =
+          usefulClusters[
+            0
+          ].slice();
+
+        const xs =
+          c.map(
+            x =>
+              x.r.left +
+              x.r.width /
+                2
+          );
+
+        const ys =
+          c.map(
+            x =>
+              x.r.top +
+              x.r.height /
+                2
+          );
+
+        const xSpan =
+          Math.max(
+            ...xs
+          ) -
+          Math.min(
+            ...xs
+          );
+
+        const ySpan =
+          Math.max(
+            ...ys
+          ) -
+          Math.min(
+            ...ys
+          );
+
+        if (
+          xSpan >=
+          ySpan
+        ) {
+          c.sort(
+            (a, b) =>
+              a.r.left -
+              b.r.left
+          );
+        } else {
+          c.sort(
+            (a, b) =>
+              a.r.top -
+              b.r.top
+          );
+        }
+
+        /*
+         * Standard Instagram action-bar order:
+         *
+         * Like
+         * Comment
+         * Repost
+         * Share
+         * Save
+         */
+        const item =
+          c[1];
+
+        if (!item) {
+          return null;
+        }
+
+        const r =
+          item.r;
+
+        return {
+          strategy:
+            `post-action-cluster-${
+              xSpan >=
+              ySpan
+                ? 'horizontal'
+                : 'vertical'
+            }`,
+
+          rect: {
+            left:
+              r.left,
+
+            top:
+              r.top,
+
+            width:
+              r.width,
+
+            height:
+              r.height,
+
+            centerX:
+              r.left +
+              r.width /
+                2,
+
+            centerY:
+              r.top +
+              r.height /
+                2
+          },
+
+          clusterSize:
+            c.length,
+
+          html:
+            item.el
+              .outerHTML
+              .slice(
+                0,
+                1600
+              )
+        };
+      }
+
+      /*
+       * Last local adjacency fallback.
+       */
+      const small =
+        iconButtons
+          .sort(
+            (a, b) =>
+              a.r.left -
+                b.r.left ||
+              a.r.top -
+                b.r.top
+          );
+
+      for (
+        let i = 0;
+        i <
+          small.length -
+            1;
+        i++
+      ) {
+        const a =
+          small[i];
+
+        const b =
+          small[i + 1];
+
+        const sameRow =
+          Math.abs(
+            a.r.top -
+              b.r.top
+          ) < 50;
+
+        const adjacent =
+          b.r.left -
+            a.r.right <
+          90;
+
+        if (
+          sameRow &&
+          adjacent
+        ) {
+          const r =
+            b.r;
 
           return {
-            index,
-
-            tag:
-              el.tagName,
-
-            role:
-              el.getAttribute(
-                'role'
-              ),
-
-            aria,
-
-            title,
-
-            text:
-              text.slice(
-                0,
-                120
-              ),
-
-            hasSvg:
-              Boolean(svg),
-
-            html:
-              el.outerHTML.slice(
-                0,
-                1200
-              ),
+            strategy:
+              'adjacent-post-action-icon',
 
             rect: {
               left:
-                rect.left,
+                r.left,
 
               top:
-                rect.top,
+                r.top,
 
               width:
-                rect.width,
+                r.width,
 
               height:
-                rect.height,
-
-              right:
-                rect.right,
-
-              bottom:
-                rect.bottom,
+                r.height,
 
               centerX:
-                rect.left +
-                rect.width / 2,
+                r.left +
+                r.width /
+                  2,
 
               centerY:
-                rect.top +
-                rect.height / 2
-            }
+                r.top +
+                r.height /
+                  2
+            },
+
+            html:
+              b.el
+                .outerHTML
+                .slice(
+                  0,
+                  1600
+                )
           };
         }
-      )
-      .filter(Boolean);
-  });
-}
-
-/**
- * پیدا کردن Comment button واقعی:
- *
- * 1) aria-label / title
- * 2) SVG metadata
- * 3) تشخیص Action Bar
- *
- * Action Bar می‌تواند:
- *
- * horizontal:
- * Like | Comment | Repost | Send | Save
- *
- * یا vertical:
- * Like
- * Comment
- * Repost
- * Send
- * Save
- */
-async function findCommentActionButton(
-  page
-) {
-  const buttons =
-    await inspectActionButtons(
-      page
-    );
-
-  /*
-   * روش ۱:
-   * Accessibility مستقیم.
-   */
-  const direct =
-    buttons.find(
-      button =>
-        /comment|comments|نظر|دیدگاه/i.test(
-          `${button.aria} ${button.title}`
-        )
-    );
-
-  if (direct) {
-    return {
-      strategy:
-        'accessibility',
-      button:
-        direct
-    };
-  }
-
-  /*
-   * روش ۲:
-   * SVG دارای title / aria-label.
-   */
-  const svgDirect =
-    buttons.find(
-      button =>
-        button.hasSvg &&
-        /comment|comments|نظر|دیدگاه/i.test(
-          button.html
-        )
-    );
-
-  if (svgDirect) {
-    return {
-      strategy:
-        'svg-semantic',
-      button:
-        svgDirect
-    };
-  }
-
-  /*
-   * روش ۳:
-   *
-   * Action Bar را از روی geometry
-   * پیدا می‌کنیم.
-   *
-   * از 20% سمت چپ صفحه به بعد:
-   * navigation را حذف می‌کنیم.
-   *
-   * Message floating button را هم حذف می‌کنیم.
-   */
-  const candidates =
-    buttons.filter(
-      button => {
-        const r =
-          button.rect;
-
-        if (
-          !button.hasSvg
-        ) {
-          return false;
-        }
-
-        if (
-          r.left <
-          vwSafe(page, 200)
-        ) {
-          return false;
-        }
-
-        if (
-          r.width > 100 ||
-          r.height > 100
-        ) {
-          return false;
-        }
-
-        if (
-          r.top < 100 ||
-          r.bottom >
-            950
-        ) {
-          return false;
-        }
-
-        if (
-          /message|messages|follow|boost|close|more/i.test(
-            `${button.aria} ${button.title} ${button.text}`
-          )
-        ) {
-          return false;
-        }
-
-        return true;
       }
-    );
 
-  /*
-   * گروه‌های افقی/عمودی.
-   */
-  const groups = [];
-
-  for (
-    const button of candidates
-  ) {
-    const sameHorizontal =
-      groups.find(
-        group =>
-          group.orientation ===
-            'horizontal' &&
-          Math.abs(
-            group.anchorY -
-              button.rect.centerY
-          ) < 35
-      );
-
-    if (
-      sameHorizontal
-    ) {
-      sameHorizontal.items.push(
-        button
-      );
-
-      continue;
+      return null;
     }
-
-    const sameVertical =
-      groups.find(
-        group =>
-          group.orientation ===
-            'vertical' &&
-          Math.abs(
-            group.anchorX -
-              button.rect.centerX
-          ) < 35
-      );
-
-    if (
-      sameVertical
-    ) {
-      sameVertical.items.push(
-        button
-      );
-
-      continue;
-    }
-
-    /*
-     * تعیین اولیه جهت:
-     * هنوز آیتم دیگری نداریم.
-     */
-    groups.push({
-      orientation:
-        'unknown',
-      anchorX:
-        button.rect.centerX,
-      anchorY:
-        button.rect.centerY,
-      items: [button]
-    });
-  }
-
-  /*
-   * گروه‌ها را با نزدیک‌ترین اعضا
-   * دوباره normalize می‌کنیم.
-   */
-  for (
-    const group of groups
-  ) {
-    if (
-      group.items.length >= 2
-    ) {
-      const xs =
-        group.items.map(
-          x =>
-            x.rect.centerX
-        );
-
-      const ys =
-        group.items.map(
-          x =>
-            x.rect.centerY
-        );
-
-      const xSpan =
-        Math.max(...xs) -
-        Math.min(...xs);
-
-      const ySpan =
-        Math.max(...ys) -
-        Math.min(...ys);
-
-      group.orientation =
-        xSpan >= ySpan
-          ? 'horizontal'
-          : 'vertical';
-    }
-  }
-
-  const usableGroups =
-    groups
-      .filter(
-        group =>
-          group.items.length >=
-          4
-      )
-      .sort(
-        (a, b) =>
-          b.items.length -
-          a.items.length
-      );
-
-  if (
-    usableGroups.length
-  ) {
-    const group =
-      usableGroups[0];
-
-    const items =
-      group.items.slice();
-
-    if (
-      group.orientation ===
-      'horizontal'
-    ) {
-      items.sort(
-        (a, b) =>
-          a.rect.centerX -
-          b.rect.centerX
-      );
-    } else {
-      items.sort(
-        (a, b) =>
-          a.rect.centerY -
-          b.rect.centerY
-      );
-    }
-
-    /*
-     * استاندارد Action Bar اینستاگرام:
-     *
-     * 0 = Like
-     * 1 = Comment
-     *
-     * اگر حداقل 4 icon در action bar
-     * داریم، آیتم دوم را Comment می‌گیریم.
-     */
-    if (
-      items.length >= 4
-    ) {
-      return {
-        strategy:
-          `action-bar-${group.orientation}`,
-        button:
-          items[1],
-        actionBar:
-          items.map(
-            item => ({
-              x:
-                item.rect.centerX,
-              y:
-                item.rect.centerY,
-              aria:
-                item.aria,
-              title:
-                item.title
-            })
-          )
-      };
-    }
-  }
-
-  /*
-   * روش آخر:
-   * آیکون‌هایی که در سمت راست
-   * action area اصلی پست هستند.
-   */
-  const rightIcons =
-    candidates
-      .filter(
-        button =>
-          button.rect.centerX >
-          500
-      )
-      .sort(
-        (a, b) =>
-          a.rect.top -
-          b.rect.top
-      );
-
-  if (
-    rightIcons.length >= 4
-  ) {
-    /*
-     * ابتدا تلاش horizontal:
-     */
-    const minY =
-      Math.min(
-        ...rightIcons.map(
-          x =>
-            x.rect.centerY
-        )
-      );
-
-    const horizontal =
-      rightIcons
-        .filter(
-          x =>
-            Math.abs(
-              x.rect.centerY -
-                minY
-            ) < 40
-        )
-        .sort(
-          (a, b) =>
-            a.rect.left -
-            b.rect.left
-        );
-
-    if (
-      horizontal.length >= 4
-    ) {
-      return {
-        strategy:
-          'action-bar-horizontal-fallback',
-        button:
-          horizontal[1]
-      };
-    }
-
-    /*
-     * vertical:
-     */
-    const x0 =
-      rightIcons[0]
-        ?.rect
-        .centerX;
-
-    const vertical =
-      rightIcons
-        .filter(
-          x =>
-            Math.abs(
-              x.rect.centerX -
-                x0
-            ) < 40
-        )
-        .sort(
-          (a, b) =>
-            a.rect.top -
-            b.rect.top
-        );
-
-    if (
-      vertical.length >= 4
-    ) {
-      return {
-        strategy:
-          'action-bar-vertical-fallback',
-        button:
-          vertical[1]
-      };
-    }
-  }
-
-  return null;
+  );
 }
 
-function vwSafe(
-  page,
-  fallback
-) {
-  /*
-   * فقط برای فیلتر تقریبی.
-   * مقدار viewport فعلی ما 1440 است.
-   */
-  return fallback;
-}
-
-/**
- * کلیک واقعی روی Comment icon.
- */
-async function clickRealCommentIcon(
+async function clickActualCommentButton(
   page
 ) {
   const found =
-    await findCommentActionButton(
+    await findCommentButton(
       page
     );
 
@@ -1040,520 +943,447 @@ async function clickRealCommentIcon(
 
   appendLog(
     'REAL_COMMENT_ICON_FOUND',
-    {
-      strategy:
-        found.strategy,
-
-      rect:
-        found.button.rect,
-
-      aria:
-        found.button.aria,
-
-      title:
-        found.button.title,
-
-      text:
-        found.button.text,
-
-      actionBar:
-        found.actionBar ||
-        null
-    }
+    found
   );
 
-  const buttons =
-    page.locator(
-      'button,[role="button"],a'
-    );
-
-  const locator =
-    buttons.nth(
-      found.button.index
-    );
-
   /*
-   * scroll into view
+   * Click the exact point belonging
+   * to the actual element.
    */
-  await locator.scrollIntoViewIfNeeded();
-
-  /*
-   * کلیک واقعی.
-   */
-  await locator.click({
-    force: true,
-    timeout: 5000
-  });
+  await page.mouse.click(
+    found.rect.centerX,
+    found.rect.centerY
+  );
 
   await page.waitForTimeout(
-    COMMENT_PANEL_WAIT
+    1200
   );
 
   return found;
 }
 
 /* =========================================================
-   COMMENT PANEL VERIFICATION
+   VERIFY REAL COMMENT UI
    ========================================================= */
 
-async function inspectAfterCommentClick(
+async function overlayFingerprint(
   page
 ) {
-  return page.evaluate(() => {
-    const bodyText =
-      document.body?.innerText ||
-      '';
-
-    const dialogs =
-      Array.from(
-        document.querySelectorAll(
-          '[role="dialog"]'
-        )
-      ).filter(
-        element => {
-          const style =
-            getComputedStyle(
-              element
-            );
-
-          const rect =
-            element.getBoundingClientRect();
-
-          return (
-            style.display !==
-              'none' &&
-            style.visibility !==
-              'hidden' &&
-            rect.width > 200 &&
-            rect.height > 200
-          );
-        }
-      );
-
-    const textareas =
-      Array.from(
-        document.querySelectorAll(
-          'textarea'
-        )
-      ).filter(
-        element =>
-          element.getBoundingClientRect()
-            .width > 0
-      );
-
-    const editables =
-      Array.from(
-        document.querySelectorAll(
-          '[contenteditable="true"]'
-        )
-      ).filter(
-        element =>
-          element.getBoundingClientRect()
-            .width > 0
-      );
-
-    const commentSignals = [
-      'View all comments',
-      'View all',
-      'Add a comment',
-      'Reply',
-      'پاسخ',
-      'نظر',
-      'دیدگاه'
-    ];
-
-    const bodySignals =
-      commentSignals.filter(
-        signal =>
-          bodyText
-            .toLocaleLowerCase()
-            .includes(
-              signal
-                .toLocaleLowerCase()
-            )
-      );
-
-    return {
-      dialogCount:
-        dialogs.length,
-
-      textareaCount:
-        textareas.length,
-
-      editableCount:
-        editables.length,
-
-      bodySignals,
-
-      bodyLength:
-        bodyText.length
-    };
-  });
-}
-
-async function verifyCommentPanel(
-  page
-) {
-  const initial =
-    await inspectAfterCommentClick(
-      page
-    );
-
-  /*
-   * Dialog is strongest signal.
-   */
-  if (
-    initial.dialogCount >
-    0
-  ) {
-    return {
-      verified: true,
-      reason:
-        'dialog'
-    };
-  }
-
-  /*
-   * اگر dialog نبود، ولی
-   * comment-specific input ایجاد شده.
-   */
-  if (
-    initial.textareaCount >
-      0 &&
-    initial.bodySignals.length >
-      0
-  ) {
-    return {
-      verified: true,
-      reason:
-        'comment-input-and-signal'
-    };
-  }
-
-  /*
-   * چند بار کوتاه صبر می‌کنیم
-   * برای رندر asynchronous.
-   */
-  for (
-    let i = 0;
-    i < 5;
-    i++
-  ) {
-    await page.waitForTimeout(
-      500
-    );
-
-    const state =
-      await inspectAfterCommentClick(
-        page
-      );
-
-    if (
-      state.dialogCount >
-        0 ||
-      (
-        state.textareaCount >
-          0 &&
-        state.bodySignals.length >
-          0
-      )
-    ) {
-      return {
-        verified: true,
-        reason:
-          state.dialogCount
-            ? 'dialog-delayed'
-            : 'comment-ui-delayed'
-      };
-    }
-  }
-
-  return {
-    verified: false,
-    reason:
-      'COMMENT_PANEL_NOT_VERIFIED'
-  };
-}
-
-/* =========================================================
-   COMMENT EXTRACTION
-   ========================================================= */
-
-async function findCommentContainer(
-  page
-) {
-  return page.evaluate(() => {
-    const dialogs =
-      Array.from(
-        document.querySelectorAll(
-          '[role="dialog"]'
-        )
-      ).filter(
-        element => {
-          const rect =
-            element.getBoundingClientRect();
-
-          const style =
-            getComputedStyle(
-              element
-            );
-
-          return (
-            rect.width > 250 &&
-            rect.height > 250 &&
-            style.display !==
-              'none'
-          );
-        }
-      );
-
-    if (
-      dialogs.length
-    ) {
-      dialogs.sort(
-        (a, b) =>
-          b.getBoundingClientRect()
-            .height -
-          a.getBoundingClientRect()
-            .height
-      );
-
-      return {
-        type:
-          'dialog',
-        found:
-          true
-      };
-    }
-
-    /*
-     * Fallback overlay:
-     * فقط وقتی بعد از click ساخته شده
-     * و right side/center است.
-     */
-    const candidates =
-      Array.from(
-        document.querySelectorAll(
-          'body *'
-        )
-      )
-        .map(
-          element => ({
-            element,
-            rect:
-              element.getBoundingClientRect(),
-            style:
-              getComputedStyle(
-                element
-              ),
-            text:
-              element.innerText ||
-              ''
-          })
-        )
-        .filter(
-          item =>
-            item.rect.width >
-              250 &&
-            item.rect.height >
-              250 &&
-            item.rect.right >
-              window.innerWidth *
-                0.35 &&
-            /(auto|scroll)/.test(
-              item.style.overflowY
-            ) &&
-            item.element
-              .scrollHeight >
-              item.element
-                .clientHeight +
-                50
-        )
-      .sort(
-        (a, b) => {
-          const score =
-            item => {
-              let s = 0;
-
-              if (
-                /Add a comment/i.test(
-                  item.text
-                )
-              ) {
-                s += 20;
-              }
-
-              if (
-                /Reply/i.test(
-                  item.text
-                )
-              ) {
-                s += 10;
-              }
-
-              if (
-                item.rect.right >
-                window.innerWidth *
-                  0.7
-              ) {
-                s += 5;
-              }
-
-              return s;
-            };
-
-          return (
-            score(b) -
-            score(a)
-          );
-        }
-      );
-
-    return {
-      type:
-        'scrollable-overlay',
-      found:
-        candidates.length >
-        0
-    };
-  });
-}
-
-async function extractVisibleComments(
-  page
-) {
-  return page.evaluate(() => {
-    const normalize =
-      value =>
-        String(value || '')
-          .normalize('NFKC')
-          .toLocaleLowerCase(
-            'fa'
-          )
-          .replace(
-            /[\u200b\u200c\u200d\ufeff]/g,
-            ''
-          )
-          .replace(
-            /[ًٌٍَُِّْـ]/g,
-            ''
-          )
-          .replace(
-            /ي/g,
-            'ی'
-          )
-          .replace(
-            /ى/g,
-            'ی'
-          )
-          .replace(
-            /ك/g,
-            'ک'
-          )
-          .replace(
-            /[ۀە]/g,
-            'ه'
-          )
-          .replace(
-            /[أإآ]/g,
-            'ا'
-          )
-          .replace(
-            /ؤ/g,
-            'و'
-          )
-          .replace(
-            /\s+/g,
-            ' '
-          )
-          .trim();
-
-    const isProfileHref =
-      href =>
-        /^\/[^/]+\/?$/.test(
-          href || ''
-        ) &&
-        !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
-          href || ''
-        );
-
-    /*
-     * تعیین container.
-     */
-    let root =
-      document.querySelector(
-        '[role="dialog"]'
-      );
-
-    if (!root) {
-      const candidates =
+  return page.evaluate(
+    () => {
+      const all =
         Array.from(
           document.querySelectorAll(
             'body *'
           )
-        )
-          .map(
-            element => {
-              const rect =
-                element.getBoundingClientRect();
+        );
 
-              const style =
+      return all
+        .map(
+          (
+            el,
+            index
+          ) => {
+            const r =
+              el.getBoundingClientRect();
+
+            const s =
+              getComputedStyle(
+                el
+              );
+
+            const text =
+              (
+                el.innerText ||
+                ''
+              ).trim();
+
+            if (
+              r.width < 250 ||
+              r.height <
+                220 ||
+              s.display ===
+                'none' ||
+              s.visibility ===
+                'hidden'
+            ) {
+              return null;
+            }
+
+            const fixedish =
+              s.position ===
+                'fixed' ||
+              s.position ===
+                'absolute' ||
+              el.getAttribute(
+                'role'
+              ) ===
+                'dialog';
+
+            const scrollable =
+              /(auto|scroll)/.test(
+                s.overflowY
+              ) &&
+              el.scrollHeight >
+                el.clientHeight +
+                  50;
+
+            const rightSide =
+              r.right >
+              window.innerWidth *
+                0.55;
+
+            const commentWords =
+              /Reply|View all comments|comments|پاسخ|نظر|دیدگاه/i.test(
+                text
+              );
+
+            if (
+              !(
+                fixedish ||
+                scrollable
+              ) ||
+              !(
+                rightSide ||
+                el.getAttribute(
+                  'role'
+                ) === 'dialog'
+              )
+            ) {
+              return null;
+            }
+
+            return {
+              index,
+
+              role:
+                el.getAttribute(
+                  'role'
+                ),
+
+              position:
+                s.position,
+
+              scrollTop:
+                el.scrollTop,
+
+              scrollHeight:
+                el.scrollHeight,
+
+              clientHeight:
+                el.clientHeight,
+
+              rect: {
+                x: r.x,
+                y: r.y,
+                width:
+                  r.width,
+                height:
+                  r.height
+              },
+
+              commentWords,
+
+              textSample:
+                text.slice(
+                  0,
+                  700
+                )
+            };
+          }
+        )
+        .filter(Boolean);
+    }
+  );
+}
+
+async function verifyCommentPanelOpened(
+  page,
+  beforeFingerprint
+) {
+  const deadline =
+    Date.now() +
+    6000;
+
+  while (
+    Date.now() <
+    deadline
+  ) {
+    const dialogs =
+      await page
+        .locator(
+          '[role="dialog"]:visible'
+        )
+        .count()
+        .catch(
+          () =>
+            0
+        );
+
+    if (
+      dialogs > 0
+    ) {
+      return {
+        verified: true,
+        strategy:
+          'visible-dialog'
+      };
+    }
+
+    const after =
+      await overlayFingerprint(
+        page
+      );
+
+    const beforeKeys =
+      new Set(
+        (
+          beforeFingerprint ||
+          []
+        ).map(
+          x =>
+            JSON.stringify(
+              [
+                x.role,
+                x.position,
+                x.rect.x,
+                x.rect.y,
+                x.rect.width,
+                x.rect.height,
+                x.scrollHeight,
+                x.textSample
+              ]
+            )
+        )
+      );
+
+    const fresh =
+      after.filter(
+        x =>
+          !beforeKeys.has(
+            JSON.stringify(
+              [
+                x.role,
+                x.position,
+                x.rect.x,
+                x.rect.y,
+                x.rect.width,
+                x.rect.height,
+                x.scrollHeight,
+                x.textSample
+              ]
+            )
+          )
+      );
+
+    if (
+      fresh.some(
+        x =>
+          x.commentWords ||
+          x.scrollHeight >
+            x.clientHeight +
+              150
+      )
+    ) {
+      return {
+        verified: true,
+        strategy:
+          'new-comment-overlay'
+      };
+    }
+
+    /*
+     * Instagram sometimes reuses an existing
+     * fixed container rather than inserting
+     * a brand new node.
+     */
+    for (
+      const b of
+      beforeFingerprint ||
+      []
+    ) {
+      const match =
+        after.find(
+          a =>
+            a.position ===
+              b.position &&
+            Math.abs(
+              a.rect.x -
+                b.rect.x
+            ) < 3 &&
+            Math.abs(
+              a.rect.y -
+                b.rect.y
+            ) < 3 &&
+            Math.abs(
+              a.rect.width -
+                b.rect.width
+            ) < 3 &&
+            Math.abs(
+              a.rect.height -
+                b.rect.height
+            ) < 3
+        );
+
+      if (!match) {
+        continue;
+      }
+
+      const textChanged =
+        match.textSample !==
+        b.textSample;
+
+      const scrollGrew =
+        match.scrollHeight >
+        b.scrollHeight +
+          120;
+
+      if (
+        (
+          textChanged ||
+          scrollGrew
+        ) &&
+        (
+          match.commentWords ||
+          match.scrollHeight >
+            match.clientHeight +
+              150
+        )
+      ) {
+        return {
+          verified: true,
+          strategy:
+            'reused-comment-overlay'
+        };
+      }
+    }
+
+    await page.waitForTimeout(
+      400
+    );
+  }
+
+  return {
+    verified: false,
+    strategy:
+      'no-new-comment-ui'
+  };
+}
+
+/* =========================================================
+   MARK REAL COMMENT ROOT
+   ========================================================= */
+
+async function markCommentRoot(
+  page
+) {
+  return page.evaluate(
+    () => {
+      const MARK =
+        'data-ig-automation-comment-root';
+
+      document
+        .querySelectorAll(
+          `[${MARK}]`
+        )
+        .forEach(
+          el =>
+            el.removeAttribute(
+              MARK
+            )
+        );
+
+      const candidates =
+        [];
+
+      /*
+       * Visible dialogs:
+       * choose the actual scrollable child
+       * when it exists.
+       */
+      const dialogs =
+        Array.from(
+          document.querySelectorAll(
+            '[role="dialog"]:visible'
+          )
+        );
+
+      for (
+        const dialog of dialogs
+      ) {
+        const r =
+          dialog.getBoundingClientRect();
+
+        const s =
+          getComputedStyle(
+            dialog
+          );
+
+        const text =
+          dialog.innerText ||
+          '';
+
+        const dialogScrollables =
+          Array.from(
+            dialog.querySelectorAll(
+              '*'
+            )
+          ).filter(
+            el => {
+              const es =
                 getComputedStyle(
-                  element
+                  el
                 );
 
-              return {
-                element,
-                rect,
-                style,
-                text:
-                  element.innerText ||
-                  ''
-              };
+              return (
+                /(auto|scroll)/.test(
+                  es.overflowY
+                ) &&
+                el.scrollHeight >
+                  el.clientHeight +
+                    80
+              );
             }
-          )
-          .filter(
-            item =>
-              item.rect.width >
-                250 &&
-              item.rect.height >
-                250 &&
-              /(auto|scroll)/.test(
-                item.style.overflowY
-              ) &&
-              item.element
-                .scrollHeight >
-                item.element
-                  .clientHeight +
-                  50 &&
-              item.rect.right >
-                window.innerWidth *
-                  0.35
-          )
-          .sort(
+          );
+
+        if (
+          dialogScrollables.length
+        ) {
+          dialogScrollables.sort(
             (a, b) => {
               const score =
-                item => {
-                  let s = 0;
-
-                  if (
-                    /Reply/i.test(
-                      item.text
+                el =>
+                  (
+                    /(
+                      Reply|
+                      پاسخ
+                    )/ix.test(
+                      el.innerText ||
+                        ''
                     )
-                  ) {
-                    s += 15;
-                  }
-
-                  if (
-                    /Add a comment/i.test(
-                      item.text
+                      ? 50
+                      : 0
+                  ) +
+                  (
+                    /(
+                      View all comments|
+                      View all \d+ comments
+                    )/ix.test(
+                      el.innerText ||
+                        ''
                     )
-                  ) {
-                    s += 10;
-                  }
-
-                  return s;
-                };
+                      ? 30
+                      : 0
+                  ) +
+                  Math.min(
+                    20,
+                    Math.floor(
+                      (
+                        el.scrollHeight -
+                        el.clientHeight
+                      ) / 100
+                    )
+                  );
 
               return (
                 score(b) -
@@ -1562,381 +1392,652 @@ async function extractVisibleComments(
             }
           );
 
-      root =
-        candidates[0]
-          ?.element ||
-        null;
-    }
+          const child =
+            dialogScrollables[0];
 
-    if (!root) {
-      return [];
-    }
+          const cr =
+            child.getBoundingClientRect();
 
-    const links =
-      Array.from(
-        root.querySelectorAll(
-          'a[href^="/"]'
-        )
-      ).filter(
-        link =>
-          isProfileHref(
-            link.getAttribute(
-              'href'
+          candidates.push({
+            el: child,
+
+            score:
+              125 +
+              (
+                /(Reply|پاسخ)/i.test(
+                  child.innerText ||
+                    ''
+                )
+                  ? 40
+                  : 0
+              ) +
+              (
+                /(
+                  View all comments|
+                  View all \d+ comments
+                )/ix.test(
+                  child.innerText ||
+                    ''
+                )
+                  ? 30
+                  : 0
+              ),
+
+            area:
+              cr.width *
+              cr.height
+          });
+        } else {
+          candidates.push({
+            el: dialog,
+
+            score:
+              100 +
+              (
+                /(Reply|پاسخ)/i.test(
+                  text
+                )
+                  ? 40
+                  : 0
+              ) +
+              (
+                /(
+                  View all comments|
+                  View all \d+ comments
+                )/ix.test(
+                  text
+                )
+                  ? 30
+                  : 0
+              ) +
+              (
+                /(auto|scroll)/.test(
+                  s.overflowY
+                )
+                  ? 25
+                  : 0
+              ),
+
+            area:
+              r.width *
+              r.height
+          });
+        }
+      }
+
+      /*
+       * Non-dialog overlay fallback.
+       */
+      const all =
+        Array.from(
+          document.querySelectorAll(
+            'body *'
+          )
+        );
+
+      for (
+        const el of all
+      ) {
+        const r =
+          el.getBoundingClientRect();
+
+        const s =
+          getComputedStyle(
+            el
+          );
+
+        const text =
+          el.innerText ||
+          '';
+
+        if (
+          r.width < 280 ||
+          r.height < 260 ||
+          r.right <
+            window.innerWidth *
+              0.55 ||
+          !(
+            s.position ===
+              'fixed' ||
+            s.position ===
+              'absolute' ||
+            /(auto|scroll)/.test(
+              s.overflowY
             )
+          ) ||
+          el.scrollHeight <=
+            el.clientHeight +
+              80
+        ) {
+          continue;
+        }
+
+        let score =
+          0;
+
+        if (
+          /Reply|پاسخ/i.test(
+            text
+          )
+        ) {
+          score += 35;
+        }
+
+        if (
+          /(
+            View all comments|
+            View all \d+ comments
+          )/ix.test(
+            text
+          )
+        ) {
+          score += 25;
+        }
+
+        if (
+          /Add a comment/i.test(
+            text
+          )
+        ) {
+          score += 5;
+        }
+
+        if (
+          el.scrollHeight >
+          1000
+        ) {
+          score += 15;
+        }
+
+        candidates.push({
+          el,
+          score,
+          area:
+            r.width *
+            r.height
+        });
+      }
+
+      candidates.sort(
+        (a, b) =>
+          (
+            b.score -
+            a.score
+          ) ||
+          (
+            b.area -
+            a.area
           )
       );
 
-    const results = [];
-    const seen = new Set();
-
-    for (
-      const link of links
-    ) {
-      const profilePath =
-        link.getAttribute(
-          'href'
-        ) || '';
-
-      const username =
-        (
-          link.textContent ||
-          ''
-        ).trim();
-
-      if (!username) {
-        continue;
-      }
-
-      const normalizedUsername =
-        normalize(
-          username
-        );
-
-      let node =
-        link;
-
-      let row =
-        null;
-
-      /*
-       * از username به parentها می‌رویم
-       * تا خود comment row را پیدا کنیم.
-       */
-      for (
-        let level = 0;
-        level < 9 &&
-        node &&
-        node !== root;
-        level++
-      ) {
-        node =
-          node.parentElement;
-
-        if (!node) {
-          break;
-        }
-
-        const text =
-          (
-            node.innerText ||
-            ''
-          ).trim();
-
-        if (
-          !text
-        ) {
-          continue;
-        }
-
-        /*
-         * Caption یا کل پست را رد کن.
-         */
-        if (
-          text.length >
-          800
-        ) {
-          continue;
-        }
-
-        const normalizedText =
-          normalize(
-            text
-          );
-
-        if (
-          !normalizedText.includes(
-            normalizedUsername
-          )
-        ) {
-          continue;
-        }
-
-        const hasReply =
-          /\bReply\b/i.test(
-            text
-          ) ||
-          /(^|\n)\s*پاسخ\s*($|\n)/i.test(
-            text
-          );
-
-        const hasTime =
-          node.querySelector(
-            'time'
-          ) !== null;
-
-        const hasLikeButton =
-          node.querySelector(
-            'button,[role="button"]'
-          ) !== null;
-
-        if (
-          !hasReply &&
-          !hasTime &&
-          !hasLikeButton
-        ) {
-          continue;
-        }
-
-        row =
-          node;
-
-        break;
-      }
-
-      if (!row) {
-        continue;
-      }
-
-      const lines =
-        (
-          row.innerText ||
-          ''
-        )
-          .split('\n')
-          .map(
-            x =>
-              x.trim()
-          )
-          .filter(Boolean);
-
-      const commentLines =
-        lines.filter(
-          line => {
-            const n =
-              normalize(
-                line
-              );
-
-            if (!n) {
-              return false;
-            }
-
-            if (
-              n ===
-              normalizedUsername
-            ) {
-              return false;
-            }
-
-            if (
-              /^(follow|following|reply|replies|like|likes|more|translated|view all replies)$/i.test(
-                n
-              )
-            ) {
-              return false;
-            }
-
-            if (
-              /^(دنبال کردن|دنبال شده|پاسخ|پاسخ ها|پسندیدن|بیشتر|ترجمه|نمایش همه پاسخ ها)$/i.test(
-                n
-              )
-            ) {
-              return false;
-            }
-
-            if (
-              /^\d+([smhdw])$/i.test(
-                n
-              )
-            ) {
-              return false;
-            }
-
-            if (
-              /^\d+([,.]\d+)*$/.test(
-                n
-              )
-            ) {
-              return false;
-            }
-
-            return true;
-          }
-        );
+      const best =
+        candidates[0];
 
       if (
-        !commentLines.length
+        !best ||
+        best.score < 30
       ) {
-        continue;
+        return false;
       }
 
-      const commentText =
-        commentLines.join(
-          '\n'
-        ).trim();
+      best.el.setAttribute(
+        MARK,
+        '1'
+      );
 
-      if (
-        !commentText
-      ) {
-        continue;
-      }
+      return {
+        score:
+          best.score,
 
-      /*
-       * اگر wrapper شامل کپشن و اطلاعات پست است،
-       * آن را comment حساب نکن.
-       */
-      if (
-        commentText.length >
-        500
-      ) {
-        continue;
-      }
+        tag:
+          best.el.tagName,
 
-      const key =
-        `${profilePath}|${normalize(
-          commentText
-        )}`;
+        role:
+          best.el.getAttribute(
+            'role'
+          ),
 
-      if (
-        seen.has(key)
-      ) {
-        continue;
-      }
+        rect:
+          (() => {
+            const r =
+              best.el.getBoundingClientRect();
 
-      seen.add(key);
+            return {
+              x:
+                r.x,
 
-      results.push({
-        key,
-        username,
-        profilePath,
-        commentText,
-        normalizedComment:
-          normalize(
-            commentText
-          )
-      });
+              y:
+                r.y,
+
+              width:
+                r.width,
+
+              height:
+                r.height
+            };
+          })(),
+
+        scrollHeight:
+          best.el.scrollHeight,
+
+        clientHeight:
+          best.el.clientHeight
+      };
     }
+  );
+}
 
-    return results;
+async function requireRealCommentRoot(
+  page
+) {
+  const info =
+    await markCommentRoot(
+      page
+    );
+
+  if (!info) {
+    throw new Error(
+      'COMMENT_ROOT_NOT_FOUND_AFTER_REAL_CLICK'
+    );
+  }
+
+  appendLog(
+    'COMMENT_ROOT_MARKED',
+    info
+  );
+
+  return page.locator(
+    '[data-ig-automation-comment-root="1"]'
+  );
+}
+
+async function saveSingleCommentsScreenshot(
+  page,
+  rootLocator
+) {
+  const file =
+    path.join(
+      ARTIFACTS,
+      'comments-list.png'
+    );
+
+  await rootLocator.screenshot({
+    path: file
   });
+
+  return file;
 }
 
 /* =========================================================
-   COMMENTS SCROLLING
+   EXTRACT COMMENTS
    ========================================================= */
 
-async function scrollCommentContainer(
-  page,
-  amount
+async function extractComments(
+  rootLocator
 ) {
-  return page.evaluate(
-    pixels => {
-      let root =
-        document.querySelector(
-          '[role="dialog"]'
+  return rootLocator.evaluate(
+    root => {
+      const normalize =
+        value =>
+          String(value || '')
+            .normalize('NFKC')
+            .toLocaleLowerCase(
+              'fa'
+            )
+            .replace(
+              /[\u200b\u200c\u200d\ufeff]/g,
+              ''
+            )
+            .replace(
+              /[ًٌٍَُِّْـ]/g,
+              ''
+            )
+            .replace(
+              /ي/g,
+              'ی'
+            )
+            .replace(
+              /ى/g,
+              'ی'
+            )
+            .replace(
+              /ك/g,
+              'ک'
+            )
+            .replace(
+              /[ۀە]/g,
+              'ه'
+            )
+            .replace(
+              /[أإآ]/g,
+              'ا'
+            )
+            .replace(
+              /ؤ/g,
+              'و'
+            )
+            .replace(
+              /\s+/g,
+              ' '
+            )
+            .trim();
+
+      const validProfile =
+        href =>
+          /^\/[^/]+\/?$/.test(
+            href || ''
+          ) &&
+          !/^\/(explore|reels|direct|accounts|stories|p|reel|about|legal)\b/i.test(
+            href || ''
+          );
+
+      const links =
+        Array.from(
+          root.querySelectorAll(
+            'a[href^="/"]'
+          )
+        ).filter(
+          a =>
+            validProfile(
+              a.getAttribute(
+                'href'
+              )
+            )
         );
 
-      if (!root) {
-        const candidates =
-          Array.from(
-            document.querySelectorAll(
-              'body *'
-            )
-          )
-            .map(
-              element => {
-                const rect =
-                  element.getBoundingClientRect();
+      const seen =
+        new Set();
 
-                const style =
-                  getComputedStyle(
-                    element
-                  );
+      const output =
+        [];
 
-                return {
-                  element,
-                  rect,
-                  style,
-                  text:
-                    element.innerText ||
-                    ''
-                };
-              }
-            )
-            .filter(
-              item =>
-                item.rect.width >
-                  250 &&
-                item.rect.height >
-                  250 &&
-                item.rect.right >
-                  window.innerWidth *
-                    0.35 &&
-                /(auto|scroll)/.test(
-                  item.style.overflowY
-                ) &&
-                item.element
-                  .scrollHeight >
-                  item.element
-                    .clientHeight +
-                    50
-            )
-            .sort(
-              (a, b) => {
-                const score =
-                  item => {
-                    let s = 0;
+      for (
+        const link of
+        links
+      ) {
+        const profilePath =
+          link.getAttribute(
+            'href'
+          ) || '';
 
-                    if (
-                      /Reply/i.test(
-                        item.text
-                      )
-                    ) {
-                      s += 15;
-                    }
+        const username =
+          (
+            link.textContent ||
+            ''
+          ).trim();
 
-                    if (
-                      /Add a comment/i.test(
-                        item.text
-                      )
-                    ) {
-                      s += 10;
-                    }
+        if (!username) {
+          continue;
+        }
 
-                    return s;
-                  };
+        const normalizedUsername =
+          normalize(
+            username
+          );
 
-                return (
-                  score(b) -
-                  score(a)
-                );
-              }
+        let row =
+          null;
+
+        let node =
+          link;
+
+        /*
+         * Walk up from username
+         * to the smallest real comment row.
+         */
+        for (
+          let level = 0;
+          level < 9 &&
+          node &&
+          node !== root;
+          level++
+        ) {
+          node =
+            node.parentElement;
+
+          if (!node) {
+            break;
+          }
+
+          const text =
+            (
+              node.innerText ||
+              ''
+            ).trim();
+
+          if (
+            !text ||
+            text.length >
+              700
+          ) {
+            continue;
+          }
+
+          const normalizedText =
+            normalize(
+              text
             );
 
-        root =
-          candidates[0]
-            ?.element ||
-          null;
+          if (
+            !normalizedText.includes(
+              normalizedUsername
+            )
+          ) {
+            continue;
+          }
+
+          if (
+            /Add a comment|View insights|Boost post/i.test(
+              text
+            )
+          ) {
+            continue;
+          }
+
+          const hasReply =
+            /(^|\n)\s*(Reply|پاسخ)\s*($|\n)/i.test(
+              text
+            );
+
+          const hasTime =
+            !!node.querySelector(
+              'time'
+            );
+
+          const hasControl =
+            !!node.querySelector(
+              'button,[role="button"]'
+            );
+
+          if (
+            !hasReply &&
+            !hasTime &&
+            !hasControl
+          ) {
+            continue;
+          }
+
+          row =
+            node;
+
+          break;
+        }
+
+        if (!row) {
+          continue;
+        }
+
+        const lines =
+          (
+            row.innerText ||
+            ''
+          )
+            .split('\n')
+            .map(
+              x =>
+                x.trim()
+            )
+            .filter(Boolean);
+
+        const commentLines =
+          lines.filter(
+            line => {
+              const n =
+                normalize(
+                  line
+                );
+
+              if (!n) {
+                return false;
+              }
+
+              if (
+                n ===
+                normalizedUsername
+              ) {
+                return false;
+              }
+
+              if (
+                /^(follow|following|reply|replies|like|likes|more|translated|view all replies)$/i.test(
+                  n
+                )
+              ) {
+                return false;
+              }
+
+              if (
+                /^(دنبال کردن|دنبال شده|پاسخ|پاسخ ها|پسندیدن|بیشتر|ترجمه|نمایش همه پاسخ ها)$/i.test(
+                  n
+                )
+              ) {
+                return false;
+              }
+
+              if (
+                /^\d+([smhdw])$/i.test(
+                  n
+                )
+              ) {
+                return false;
+              }
+
+              if (
+                /^\d+([,.]\d+)*$/.test(
+                  n
+                )
+              ) {
+                return false;
+              }
+
+              return true;
+            }
+          );
+
+        if (
+          !commentLines.length
+        ) {
+          continue;
+        }
+
+        const commentText =
+          commentLines.join(
+            '\n'
+          ).trim();
+
+        if (
+          !commentText ||
+          commentText.length >
+            500
+        ) {
+          continue;
+        }
+
+        const key =
+          `${profilePath}|${normalize(
+            commentText
+          )}`;
+
+        if (
+          seen.has(
+            key
+          )
+        ) {
+          continue;
+        }
+
+        seen.add(
+          key
+        );
+
+        output.push({
+          key,
+          username,
+          profilePath,
+          commentText,
+          normalizedComment:
+            normalize(
+              commentText
+            )
+        });
       }
 
-      if (!root) {
-        return {
-          changed: false,
-          before: null,
-          after: null
-        };
-      }
+      return output;
+    }
+  );
+}
 
+async function clickMoreComments(
+  rootLocator
+) {
+  return rootLocator
+    .evaluate(
+      root => {
+        const elements =
+          Array.from(
+            root.querySelectorAll(
+              'button,[role="button"],a,span,div'
+            )
+          );
+
+        for (
+          const el of
+          elements
+        ) {
+          const text =
+            (
+              el.innerText ||
+              ''
+            ).trim();
+
+          if (
+            /^(View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات)$/i.test(
+              text
+            )
+          ) {
+            el.click();
+
+            return true;
+          }
+        }
+
+        return false;
+      }
+    )
+    .catch(
+      () => false
+    );
+}
+
+async function scrollRoot(
+  rootLocator,
+  amount
+) {
+  return rootLocator.evaluate(
+    (
+      root,
+      step
+    ) => {
       const before =
         root.scrollTop;
 
@@ -1950,14 +2051,10 @@ async function scrollCommentContainer(
       root.scrollTop =
         Math.min(
           max,
-          before + pixels
+          before + step
         );
 
       return {
-        changed:
-          root.scrollTop !==
-          before,
-
         before,
 
         after:
@@ -1969,272 +2066,503 @@ async function scrollCommentContainer(
           root.clientHeight,
 
         scrollHeight:
-          root.scrollHeight
+          root.scrollHeight,
+
+        changed:
+          root.scrollTop !==
+          before,
+
+        atBottom:
+          root.scrollTop >=
+          max - 8
       };
     },
     amount
   );
 }
 
-async function clickMoreComments(
-  page
+/* =========================================================
+   FULL COMMENT SCAN TO END
+   ========================================================= */
+
+async function collectAllComments(
+  page,
+  rootLocator
 ) {
-  return page.evaluate(() => {
-    let root =
-      document.querySelector(
-        '[role="dialog"]'
+  const byKey =
+    new Map();
+
+  let stableAtBottom =
+    0;
+
+  let previousSignature =
+    '';
+
+  for (
+    let round = 1;
+    round <=
+      MAX_SCAN_ROUNDS;
+    round++
+  ) {
+    const before =
+      await rootLocator.evaluate(
+        root => ({
+          scrollTop:
+            root.scrollTop,
+
+          scrollHeight:
+            root.scrollHeight,
+
+          clientHeight:
+            root.clientHeight,
+
+          max:
+            Math.max(
+              0,
+              root.scrollHeight -
+                root.clientHeight
+            )
+        })
       );
 
-    if (!root) {
-      return false;
+    const clickedMore =
+      await clickMoreComments(
+        rootLocator
+      );
+
+    if (
+      clickedMore
+    ) {
+      await page.waitForTimeout(
+        500
+      );
     }
 
-    const candidates =
-      Array.from(
-        root.querySelectorAll(
-          'button,[role="button"],a,span,div'
-        )
+    const visible =
+      await extractComments(
+        rootLocator
       );
 
-    for (
-      const candidate of
-      candidates
-    ) {
-      const text =
-        (
-          candidate.innerText ||
-          ''
-        ).trim();
+    let added =
+      0;
 
+    for (
+      const comment of
+      visible
+    ) {
       if (
-        /^(View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات)$/i.test(
-          text
+        !byKey.has(
+          comment.key
         )
       ) {
-        candidate.click();
+        byKey.set(
+          comment.key,
+          comment
+        );
 
-        return true;
+        added++;
       }
     }
 
-    return false;
-  });
+    const scroll =
+      await scrollRoot(
+        rootLocator,
+        SCROLL_STEP
+      );
+
+    await page.waitForTimeout(
+      SCROLL_WAIT
+    );
+
+    const after =
+      await rootLocator.evaluate(
+        root => ({
+          scrollTop:
+            root.scrollTop,
+
+          scrollHeight:
+            root.scrollHeight,
+
+          clientHeight:
+            root.clientHeight,
+
+          max:
+            Math.max(
+              0,
+              root.scrollHeight -
+                root.clientHeight
+            )
+        })
+      );
+
+    const signature =
+      JSON.stringify({
+        count:
+          byKey.size,
+
+        scrollTop:
+          after.scrollTop,
+
+        max:
+          after.max,
+
+        scrollHeight:
+          after.scrollHeight
+      });
+
+    if (
+      after.scrollTop >=
+        after.max - 8 &&
+      added === 0 &&
+      !clickedMore &&
+      signature ===
+        previousSignature
+    ) {
+      stableAtBottom++;
+    } else {
+      stableAtBottom =
+        0;
+    }
+
+    previousSignature =
+      signature;
+
+    if (
+      round === 1 ||
+      round % 5 === 0 ||
+      added > 0 ||
+      clickedMore
+    ) {
+      appendLog(
+        'COMMENT_SCAN_ROUND',
+        {
+          round,
+
+          visible:
+            visible.length,
+
+          added,
+
+          totalUnique:
+            byKey.size,
+
+          before,
+
+          scroll,
+
+          after,
+
+          clickedMore,
+
+          stableAtBottom
+        }
+      );
+    }
+
+    /*
+     * Stop ONLY after reaching bottom and
+     * remaining stable for multiple rounds.
+     */
+    if (
+      stableAtBottom >=
+      END_STABLE_ROUNDS
+    ) {
+      appendLog(
+        'COMMENT_SCAN_END_REACHED',
+        {
+          round,
+
+          totalUnique:
+            byKey.size,
+
+          final:
+            after
+        }
+      );
+
+      break;
+    }
+  }
+
+  return Array.from(
+    byKey.values()
+  );
 }
 
 /* =========================================================
-   COMMENT REPLY
+   REVEAL MATCHED COMMENT IN VIRTUALIZED LIST
    ========================================================= */
 
-async function clickReplyForComment(
+async function revealComment(
   page,
+  rootLocator,
   comment
 ) {
-  const result =
-    await page.evaluate(
-      target => {
-        const root =
-          document.querySelector(
-            '[role="dialog"]'
-          );
-
-        if (!root) {
-          return {
-            clicked: false,
-            reason:
-              'comment-dialog-not-found'
-          };
-        }
-
-        const normalize =
-          value =>
-            String(value || '')
-              .normalize(
-                'NFKC'
-              )
-              .toLocaleLowerCase(
-                'fa'
-              )
-              .replace(
-                /[\u200b\u200c\u200d\ufeff]/g,
-                ''
-              )
-              .replace(
-                /[ًٌٍَُِّْـ]/g,
-                ''
-              )
-              .replace(
-                /ي/g,
-                'ی'
-              )
-              .replace(
-                /ك/g,
-                'ک'
-              )
-              .replace(
-                /[ۀە]/g,
-                'ه'
-              )
-              .replace(
-                /[أإآ]/g,
-                'ا'
-              )
-              .replace(
-                /\s+/g,
-                ' '
-              )
-              .trim();
-
-        const links =
-          Array.from(
-            root.querySelectorAll(
-              'a[href^="/"]'
-            )
-          );
-
-        for (
-          const link of links
-        ) {
-          const href =
-            link.getAttribute(
-              'href'
-            ) || '';
-
-          if (
-            href !==
-            target.profilePath
-          ) {
-            continue;
-          }
-
-          const username =
-            normalize(
-              link.textContent ||
-                ''
-            );
-
-          if (
-            username !==
-            normalize(
-              target.username
-            )
-          ) {
-            continue;
-          }
-
-          let node =
-            link;
-
-          for (
-            let level = 0;
-            level < 9 &&
-            node &&
-            node !== root;
-            level++
-          ) {
-            node =
-              node.parentElement;
-
-            if (!node) {
-              break;
-            }
-
-            const text =
-              normalize(
-                node.innerText ||
-                  ''
-              );
-
-            if (
-              !text.includes(
-                normalize(
-                  target.commentText
+  for (
+    let attempt = 0;
+    attempt < 30;
+    attempt++
+  ) {
+    const handle =
+      await rootLocator
+        .evaluateHandle(
+          (
+            root,
+            target
+          ) => {
+            const normalize =
+              value =>
+                String(
+                  value || ''
                 )
-              )
-            ) {
-              continue;
-            }
+                  .normalize(
+                    'NFKC'
+                  )
+                  .toLocaleLowerCase(
+                    'fa'
+                  )
+                  .replace(
+                    /[\u200b\u200c\u200d\ufeff]/g,
+                    ''
+                  )
+                  .replace(
+                    /[ًٌٍَُِّْـ]/g,
+                    ''
+                  )
+                  .replace(
+                    /ي/g,
+                    'ی'
+                  )
+                  .replace(
+                    /ى/g,
+                    'ی'
+                  )
+                  .replace(
+                    /ك/g,
+                    'ک'
+                  )
+                  .replace(
+                    /[ۀە]/g,
+                    'ه'
+                  )
+                  .replace(
+                    /[أإآ]/g,
+                    'ا'
+                  )
+                  .replace(
+                    /ؤ/g,
+                    'و'
+                  )
+                  .replace(
+                    /\s+/g,
+                    ' '
+                  )
+                  .trim();
 
-            const controls =
+            const links =
               Array.from(
-                node.querySelectorAll(
-                  'button,[role="button"],span,div'
+                root.querySelectorAll(
+                  'a[href^="/"]'
                 )
               );
 
             for (
-              const control of
-              controls
+              const link of
+              links
             ) {
-              const label =
-                normalize(
-                  (
-                    control.innerText ||
-                    ''
-                  ).trim()
-                );
-
-              const aria =
-                normalize(
-                  control.getAttribute(
-                    'aria-label'
-                  ) ||
-                    ''
-                );
+              if (
+                (
+                  link.getAttribute(
+                    'href'
+                  ) || ''
+                ) !==
+                target.profilePath
+              ) {
+                continue;
+              }
 
               if (
-                label ===
-                  'reply' ||
-                label ===
-                  'پاسخ' ||
-                aria.includes(
-                  'reply'
-                ) ||
-                aria.includes(
-                  'پاسخ'
+                normalize(
+                  link.textContent ||
+                    ''
+                ) !==
+                normalize(
+                  target.username
                 )
               ) {
-                control.click();
+                continue;
+              }
 
-                return {
-                  clicked: true
-                };
+              let node =
+                link;
+
+              for (
+                let level = 0;
+                level < 10 &&
+                node &&
+                node !== root;
+                level++
+              ) {
+                node =
+                  node.parentElement;
+
+                if (!node) {
+                  break;
+                }
+
+                const text =
+                  normalize(
+                    node.innerText ||
+                      ''
+                  );
+
+                if (
+                  text.includes(
+                    normalize(
+                      target.commentText
+                    )
+                  ) &&
+                  text.includes(
+                    normalize(
+                      target.username
+                    )
+                  ) &&
+                  !/Add a comment|View insights|Boost post/i.test(
+                    text
+                  )
+                ) {
+                  node.scrollIntoView(
+                    {
+                      block:
+                        'center',
+                      inline:
+                        'nearest'
+                    }
+                  );
+
+                  return node;
+                }
               }
             }
-          }
+
+            return null;
+          },
+          comment
+        );
+
+    const element =
+      handle.asElement();
+
+    if (
+      element
+    ) {
+      return element;
+    }
+
+    await rootLocator.evaluate(
+      root => {
+        const max =
+          Math.max(
+            0,
+            root.scrollHeight -
+              root.clientHeight
+          );
+
+        root.scrollTop =
+          Math.min(
+            max,
+            root.scrollTop +
+              Math.floor(
+                root.clientHeight *
+                  0.75
+              )
+          );
+      }
+    );
+
+    await page.waitForTimeout(
+      500
+    );
+  }
+
+  throw new Error(
+    'COMMENT_NOT_REVEALED_FOR_PROCESSING'
+  );
+}
+
+/* =========================================================
+   REPLY
+   ========================================================= */
+
+async function clickReplyOnComment(
+  page,
+  commentElement
+) {
+  const result =
+    await commentElement.evaluate(
+      node => {
+        const controls =
+          Array.from(
+            node.querySelectorAll(
+              'button,[role="button"],span,div'
+            )
+          );
+
+        const reply =
+          controls.find(
+            el => {
+              const label =
+                `${
+                  el.innerText ||
+                  ''
+                } ${
+                  el.getAttribute(
+                    'aria-label'
+                  ) || ''
+                }`.trim();
+
+              return (
+                /^(reply|پاسخ)$/i.test(
+                  label
+                ) ||
+                /\breply\b/i.test(
+                  label
+                ) ||
+                /پاسخ/i.test(
+                  label
+                )
+              );
+            }
+          );
+
+        if (
+          !reply
+        ) {
+          return false;
         }
 
-        return {
-          clicked: false,
-          reason:
-            'reply-button-not-found'
-        };
-      },
-      comment
+        reply.click();
+
+        return true;
+      }
     );
 
   if (
-    !result.clicked
+    !result
   ) {
     throw new Error(
-      `Reply click failed: ${result.reason}`
+      'REPLY_BUTTON_NOT_FOUND'
     );
   }
-}
-
-async function sendReply(
-  page,
-  comment,
-  replyText
-) {
-  await clickReplyForComment(
-    page,
-    comment
-  );
 
   await page.waitForTimeout(
     500
   );
+}
 
+async function findReplyInput(
+  page
+) {
   const candidates = [
     page
       .getByPlaceholder(
@@ -2255,8 +2583,6 @@ async function sendReply(
       .last()
   ];
 
-  let input = null;
-
   for (
     const candidate of
     candidates
@@ -2268,16 +2594,31 @@ async function sendReply(
           () => false
         )
     ) {
-      input =
-        candidate;
-
-      break;
+      return candidate;
     }
   }
 
+  return null;
+}
+
+async function sendReply(
+  page,
+  commentElement,
+  replyText
+) {
+  await clickReplyOnComment(
+    page,
+    commentElement
+  );
+
+  const input =
+    await findReplyInput(
+      page
+    );
+
   if (!input) {
     throw new Error(
-      'Reply input was not found.'
+      'REPLY_INPUT_NOT_FOUND'
     );
   }
 
@@ -2285,29 +2626,33 @@ async function sendReply(
     replyText
   );
 
-  let submitted =
-    await safeClick(
-      page.getByRole(
+  const postButton =
+    page
+      .getByRole(
         'button',
         {
           name:
             /Post|Reply|Send|ارسال|پاسخ/i
         }
-      ),
-      3000
-    );
+      )
+      .last();
 
-  if (!submitted) {
+  if (
+    !(await safeClick(
+      postButton,
+      3000
+    ))
+  ) {
     await input.press(
       'Enter'
     );
   }
 
   await page.waitForTimeout(
-    1000
+    900
   );
 
-  const remaining =
+  let value =
     await input
       .inputValue()
       .catch(
@@ -2315,9 +2660,7 @@ async function sendReply(
       );
 
   if (
-    String(
-      remaining || ''
-    ).trim()
+    String(value).trim()
   ) {
     await input.press(
       'Enter'
@@ -2326,22 +2669,20 @@ async function sendReply(
     await page.waitForTimeout(
       900
     );
+
+    value =
+      await input
+        .inputValue()
+        .catch(
+          () => ''
+        );
   }
 
-  const finalValue =
-    await input
-      .inputValue()
-      .catch(
-        () => ''
-      );
-
   if (
-    String(
-      finalValue || ''
-    ).trim()
+    String(value).trim()
   ) {
     throw new Error(
-      'Reply submission could not be confirmed.'
+      'REPLY_NOT_CONFIRMED'
     );
   }
 }
@@ -2361,14 +2702,11 @@ async function sendDM(
       dmPage.url()
     ).origin;
 
-  const url =
+  await dmPage.goto(
     new URL(
       profilePath,
       origin
-    ).href;
-
-  await dmPage.goto(
-    url,
+    ).href,
     {
       waitUntil:
         'domcontentloaded',
@@ -2415,11 +2753,11 @@ async function sendDM(
     ) {
       await safeClick(
         more,
-        2200
+        2000
       );
 
       await dmPage.waitForTimeout(
-        500
+        400
       );
     }
 
@@ -2436,7 +2774,7 @@ async function sendDM(
 
   if (!opened) {
     throw new Error(
-      `Message button not found for ${username}.`
+      `MESSAGE_BUTTON_NOT_FOUND:${username}`
     );
   }
 
@@ -2470,7 +2808,8 @@ async function sendDM(
       .last()
   ];
 
-  let input = null;
+  let input =
+    null;
 
   for (
     const candidate of
@@ -2492,7 +2831,7 @@ async function sendDM(
 
   if (!input) {
     throw new Error(
-      `DM input not found for ${username}.`
+      `DM_INPUT_NOT_FOUND:${username}`
     );
   }
 
@@ -2500,19 +2839,23 @@ async function sendDM(
     message
   );
 
-  const submitted =
-    await safeClick(
-      dmPage.getByRole(
+  const sendButton =
+    dmPage
+      .getByRole(
         'button',
         {
           name:
             /Send|ارسال/i
         }
-      ),
-      2500
-    );
+      )
+      .last();
 
-  if (!submitted) {
+  if (
+    !(await safeClick(
+      sendButton,
+      2500
+    ))
+  ) {
     await input.press(
       'Enter'
     );
@@ -2522,7 +2865,7 @@ async function sendDM(
     900
   );
 
-  const remaining =
+  let value =
     await input
       .inputValue()
       .catch(
@@ -2530,9 +2873,7 @@ async function sendDM(
       );
 
   if (
-    String(
-      remaining || ''
-    ).trim()
+    String(value).trim()
   ) {
     await input.press(
       'Enter'
@@ -2541,84 +2882,213 @@ async function sendDM(
     await dmPage.waitForTimeout(
       800
     );
+
+    value =
+      await input
+        .inputValue()
+        .catch(
+          () => ''
+        );
   }
 
-  const finalValue =
-    await input
-      .inputValue()
-      .catch(
-        () => ''
-      );
-
   if (
-    String(
-      finalValue || ''
-    ).trim()
+    String(value).trim()
   ) {
     throw new Error(
-      `DM submission could not be confirmed for ${username}.`
+      `DM_NOT_CONFIRMED:${username}`
     );
   }
 }
 
 /* =========================================================
-   ONE SCREENSHOT
+   PROCESS MATCHES
    ========================================================= */
 
-async function saveCommentsScreenshot(
-  page
+async function processMatches(
+  page,
+  dmPage,
+  rootLocator,
+  comments,
+  keywords,
+  commentReply,
+  dmReply,
+  postLog
 ) {
-  const file =
-    path.join(
-      ARTIFACTS,
-      'comments-list.png'
-    );
-
-  const dialog =
-    await page
-      .locator(
-        '[role="dialog"]'
-      )
-      .last();
-
-  if (
-    await dialog
-      .isVisible()
-      .catch(
-        () => false
-      )
-  ) {
-    await dialog.screenshot({
-      path: file
-    });
-
-    return file;
-  }
-
-  const viewport =
-    await page.viewportSize();
-
-  const controls =
-    await inspectActionButtons(
-      page
-    );
+  const matches =
+    [];
 
   /*
-   * fallback screen screenshot،
-   * ولی فقط بعد از verified comment UI.
+   * First determine every match from
+   * the complete collected comment set.
    */
-  if (
-    viewport
+  for (
+    const comment of
+    comments
   ) {
-    await page.screenshot({
-      path: file,
-      fullPage: false
+    const match =
+      keywordMatch(
+        comment.commentText,
+        keywords
+      );
+
+    if (
+      !match.matched
+    ) {
+      continue;
+    }
+
+    matches.push({
+      comment,
+      match
     });
 
-    return file;
+    postLog.matchesFound++;
+
+    appendLog(
+      'MATCH_FOUND',
+      {
+        username:
+          comment.username,
+
+        profile:
+          comment.profilePath,
+
+        keyword:
+          match.keyword,
+
+        mode:
+          match.mode,
+
+        distance:
+          match.distance,
+
+        comment:
+          comment.commentText
+      }
+    );
   }
 
-  return null;
+  /*
+   * Then process each match one-by-one.
+   */
+  for (
+    const {
+      comment,
+      match
+    } of matches
+  ) {
+    const item = {
+      username:
+        comment.username,
+
+      profile:
+        comment.profilePath,
+
+      comment:
+        comment.commentText,
+
+      keyword:
+        match.keyword,
+
+      mode:
+        match.mode,
+
+      distance:
+        match.distance,
+
+      reply:
+        'pending',
+
+      dm:
+        'pending',
+
+      status:
+        'pending'
+    };
+
+    try {
+      const row =
+        await revealComment(
+          page,
+          rootLocator,
+          comment
+        );
+
+      await sendReply(
+        page,
+        row,
+        commentReply
+      );
+
+      item.reply =
+        'sent';
+
+      appendLog(
+        'REPLY_SENT',
+        {
+          username:
+            comment.username,
+
+          keyword:
+            match.keyword
+        }
+      );
+
+      await sendDM(
+        dmPage,
+        comment.profilePath,
+        comment.username,
+        dmReply
+      );
+
+      item.dm =
+        'sent';
+
+      item.status =
+        'done';
+
+      postLog.matchesCompleted++;
+
+      appendLog(
+        'DM_SENT',
+        {
+          username:
+            comment.username
+        }
+      );
+    } catch (error) {
+      item.status =
+        'error';
+
+      item.error =
+        String(
+          error?.message ||
+            error
+        );
+
+      postLog.matchesFailed++;
+
+      appendLog(
+        'MATCH_FAILED',
+        {
+          username:
+            comment.username,
+
+          comment:
+            comment.commentText,
+
+          error:
+            item.error
+        }
+      );
+    }
+
+    postLog.matchItems.push(
+      item
+    );
+  }
+
+  return matches;
 }
 
 /* =========================================================
@@ -2636,11 +3106,16 @@ async function processPost(
 ) {
   const postLog = {
     postIndex,
+
     url,
+
     startedAt:
       now(),
 
     screenshot:
+      null,
+
+    commentClickStrategy:
       null,
 
     commentsScanned:
@@ -2658,11 +3133,8 @@ async function processPost(
     matchItems:
       [],
 
-    rounds:
-      0,
-
-    commentClickStrategy:
-      null
+    scanRounds:
+      0
   };
 
   appendLog(
@@ -2690,76 +3162,62 @@ async function processPost(
   );
 
   /*
-   * =======================================================
-   * STEP 1:
-   * REAL ACTION BAR COMMENT ICON
-   * =======================================================
+   * Fingerprint BEFORE click.
    */
-  let commentButton;
-
-  try {
-    commentButton =
-      await clickRealCommentIcon(
-        page
-      );
-  } catch (error) {
-    appendLog(
-      'REAL_COMMENT_CLICK_FAILED',
-      {
-        error:
-          String(
-            error?.message ||
-              error
-          )
-      }
+  const beforeFingerprint =
+    await overlayFingerprint(
+      page
     );
 
-    throw error;
-  }
+  /*
+   * Find and click actual Comment icon.
+   */
+  const clickInfo =
+    await clickActualCommentButton(
+      page
+    );
 
   postLog.commentClickStrategy =
-    commentButton.strategy;
+    clickInfo.strategy;
 
   /*
-   * =======================================================
-   * STEP 2:
-   * VERIFY COMMENT UI
-   * =======================================================
+   * Verify that a REAL comment UI
+   * appeared after click.
    */
   const verification =
-    await verifyCommentPanel(
-      page
+    await verifyCommentPanelOpened(
+      page,
+      beforeFingerprint
     );
 
   appendLog(
     'COMMENT_UI_VERIFICATION',
-    {
-      verified:
-        verification.verified,
-
-      reason:
-        verification.reason
-    }
+    verification
   );
 
   if (
     !verification.verified
   ) {
     throw new Error(
-      'REAL_COMMENT_BUTTON_CLICKED_BUT_COMMENT_UI_DID_NOT_OPEN'
+      'COMMENT_UI_DID_NOT_OPEN_AFTER_REAL_ICON_CLICK'
     );
   }
 
   /*
-   * =======================================================
-   * STEP 3:
-   * NOW AND ONLY NOW:
-   * ONE SCREENSHOT
-   * =======================================================
+   * Mark only the real comment root.
+   */
+  const root =
+    await requireRealCommentRoot(
+      page
+    );
+
+  /*
+   * Exactly ONE screenshot.
    */
   postLog.screenshot =
-    await saveCommentsScreenshot(
-      page
+    await saveSingleCommentsScreenshot(
+      page,
+      root
     );
 
   appendLog(
@@ -2771,332 +3229,63 @@ async function processPost(
   );
 
   /*
-   * Ensure comment container exists.
+   * Start from top of actual comment root.
    */
-  const container =
-    await findCommentContainer(
-      page
-    );
-
-  if (
-    !container?.found
-  ) {
-    throw new Error(
-      'COMMENT_UI_VERIFIED_BUT_COMMENT_CONTAINER_NOT_FOUND'
-    );
-  }
-
-  appendLog(
-    'COMMENT_CONTAINER_CONFIRMED',
-    {
-      type:
-        container.type
+  await root.evaluate(
+    el => {
+      el.scrollTop =
+        0;
     }
   );
 
+  await page.waitForTimeout(
+    500
+  );
+
   /*
-   * =======================================================
-   * STEP 4:
-   * SCAN
-   * =======================================================
+   * Full scan to bottom.
    */
-  const processed =
-    new Set();
-
-  let stable =
-    0;
-
-  let previousVisible =
-    -1;
-
-  for (
-    let round = 1;
-    round <= MAX_SCAN_ROUNDS;
-    round++
-  ) {
-    postLog.rounds =
-      round;
-
-    const comments =
-      await extractVisibleComments(
-        page
-      );
-
-    let newMatchCount =
-      0;
-
-    /*
-     * هر کامنت visible همان لحظه بررسی می‌شود.
-     */
-    for (
-      const comment of
-      comments
-    ) {
-      const match =
-        keywordMatch(
-          comment.commentText,
-          keywords
-        );
-
-      if (
-        !match.matched
-      ) {
-        continue;
-      }
-
-      const matchKey =
-        `${comment.profilePath}|${compactText(
-          comment.commentText
-        )}|${match.keyword}`;
-
-      if (
-        processed.has(
-          matchKey
-        )
-      ) {
-        continue;
-      }
-
-      processed.add(
-        matchKey
-      );
-
-      newMatchCount++;
-
-      postLog.matchesFound++;
-
-      appendLog(
-        'MATCH_FOUND',
-        {
-          round,
-
-          username:
-            comment.username,
-
-          profile:
-            comment.profilePath,
-
-          keyword:
-            match.keyword,
-
-          mode:
-            match.mode,
-
-          distance:
-            match.distance,
-
-          comment:
-            comment.commentText
-        }
-      );
-
-      /*
-       * Reply + DM بلافاصله.
-       */
-      const item = {
-        username:
-          comment.username,
-
-        profile:
-          comment.profilePath,
-
-        comment:
-          comment.commentText,
-
-        keyword:
-          match.keyword,
-
-        mode:
-          match.mode,
-
-        distance:
-          match.distance,
-
-        reply:
-          'pending',
-
-        dm:
-          'pending',
-
-        status:
-          'pending'
-      };
-
-      try {
-        await sendReply(
-          page,
-          comment,
-          commentReply
-        );
-
-        item.reply =
-          'sent';
-
-        appendLog(
-          'REPLY_SENT',
-          {
-            username:
-              comment.username
-          }
-        );
-
-        /*
-         * DM در page دوم.
-         */
-        await sendDM(
-          dmPage,
-          comment.profilePath,
-          comment.username,
-          dmReply
-        );
-
-        item.dm =
-          'sent';
-
-        item.status =
-          'done';
-
-        postLog.matchesCompleted++;
-
-        appendLog(
-          'MATCH_COMPLETED',
-          {
-            username:
-              comment.username
-          }
-        );
-      } catch (error) {
-        item.status =
-          'error';
-
-        item.error =
-          String(
-            error?.message ||
-              error
-          );
-
-        postLog.matchesFailed++;
-
-        appendLog(
-          'MATCH_FAILED',
-          {
-            username:
-              comment.username,
-
-            comment:
-              comment.commentText,
-
-            error:
-              item.error
-          }
-        );
-      }
-
-      postLog.matchItems.push(
-        item
-      );
-    }
-
-    postLog.commentsScanned =
-      comments.length;
-
-    /*
-     * Logging کنترل‌شده.
-     */
-    if (
-      round === 1 ||
-      round % 5 === 0 ||
-      newMatchCount > 0
-    ) {
-      appendLog(
-        'SCAN_ROUND',
-        {
-          round,
-
-          visibleComments:
-            comments.length,
-
-          newMatches:
-            newMatchCount,
-
-          totalMatches:
-            postLog.matchesFound,
-
-          completed:
-            postLog.matchesCompleted,
-
-          failed:
-            postLog.matchesFailed
-        }
-      );
-    }
-
-    /*
-     * Load more.
-     */
-    let clickedMore =
-      false;
-
-    if (
-      round === 1 ||
-      round % 2 === 0
-    ) {
-      clickedMore =
-        await clickMoreComments(
-          page
-        );
-    }
-
-    /*
-     * Scroll.
-     */
-    const scroll =
-      await scrollCommentContainer(
-        page,
-        COMMENT_SCROLL_STEP
-      );
-
-    await page.waitForTimeout(
-      COMMENT_SCROLL_WAIT
+  const comments =
+    await collectAllComments(
+      page,
+      root
     );
 
-    /*
-     * Stable detection.
-     */
-    if (
-      comments.length ===
-        previousVisible &&
-      !clickedMore &&
-      !scroll.changed &&
-      newMatchCount === 0
-    ) {
-      stable++;
-    } else {
-      stable = 0;
+  postLog.commentsScanned =
+    comments.length;
+
+  appendLog(
+    'COMMENT_SCAN_COMPLETE',
+    {
+      comments:
+        comments.length,
+
+      keywordCount:
+        keywords.length
     }
+  );
 
-    previousVisible =
-      comments.length;
-
-    if (
-      stable >= 6
-    ) {
-      appendLog(
-        'SCAN_STOP_STABLE',
-        {
-          round,
-
-          visibleComments:
-            comments.length,
-
-          matches:
-            postLog.matchesFound
-        }
-      );
-
-      break;
-    }
+  if (
+    !comments.length
+  ) {
+    throw new Error(
+      'REAL_COMMENT_ROOT_OPENED_BUT_ZERO_REAL_COMMENTS_EXTRACTED'
+    );
   }
+
+  /*
+   * Match + Reply + DM.
+   */
+  await processMatches(
+    page,
+    dmPage,
+    root,
+    comments,
+    keywords,
+    commentReply,
+    dmReply,
+    postLog
+  );
 
   postLog.finishedAt =
     now();
@@ -3155,6 +3344,9 @@ async function main() {
       'INSTAGRAM_DM_REPLY'
     );
 
+  /*
+   * Reset log.
+   */
   fs.writeFileSync(
     path.join(
       ARTIFACTS,
@@ -3174,6 +3366,9 @@ async function main() {
         'false'
     });
 
+  /*
+   * Same browser context => same Instagram session.
+   */
   const context =
     await browser.newContext({
       storageState:
@@ -3188,14 +3383,14 @@ async function main() {
 
   /*
    * Main page:
-   * Post + comments
+   * Post + Comment List.
    */
   const page =
     await context.newPage();
 
   /*
    * Second page:
-   * DM only.
+   * DM.
    */
   const dmPage =
     await context.newPage();
@@ -3205,27 +3400,34 @@ async function main() {
       now(),
 
     keywords,
+
     postUrls,
 
     config: {
       engine:
-        'Instagram Web Desktop - real post Action Bar Comment button',
+        'Instagram Web Desktop - verified real Comment button + real comment root',
 
       maxScanRounds:
         MAX_SCAN_ROUNDS,
 
-      commentScrollStep:
-        COMMENT_SCROLL_STEP,
+      scrollStep:
+        SCROLL_STEP,
 
-      commentScrollWait:
-        COMMENT_SCROLL_WAIT,
+      scrollWait:
+        SCROLL_WAIT,
+
+      endStableRounds:
+        END_STABLE_ROUNDS,
 
       screenshotsPerPost:
         1
     },
 
-    posts: [],
-    errors: []
+    posts:
+      [],
+
+    errors:
+      []
   };
 
   try {
@@ -3293,11 +3495,17 @@ async function main() {
     runLog.finishedAt =
       now();
 
+    /*
+     * Summary JSON.
+     */
     writeJson(
       'run-summary.json',
       runLog
     );
 
+    /*
+     * Save latest session state.
+     */
     await context
       .storageState({
         path:
@@ -3314,10 +3522,12 @@ async function main() {
   }
 
   if (
-    runLog.errors.length > 0 ||
+    runLog.errors.length >
+      0 ||
     runLog.posts.some(
       post =>
-        post.matchesFailed > 0
+        post.matchesFailed >
+        0
     )
   ) {
     process.exitCode =

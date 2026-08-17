@@ -2052,23 +2052,56 @@ async function sendDM(dmPage, profilePath, username, message) {
 
 
 async function ensureCommentsUi(page, postUrl) {
-  const existingRoot = page.locator('[data-ig-comment-root="1"]').first();
-  if (await existingRoot.isVisible().catch(() => false)) {
-    return existingRoot;
-  }
+  // After a successful DM, always reload the post and rebuild the real
+  // Comment UI. Never trust the old root marker: Instagram may leave the
+  // previous DOM subtree mounted while its visible panel is already closed.
+  appendLog('COMMENTS_RETURN_REOPEN_REQUIRED', { url: postUrl });
 
   await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1200);
   await dismissCommonPopups(page);
 
+  await page.evaluate(() => {
+    document.querySelectorAll('[data-ig-comment-root="1"]').forEach(el => {
+      el.removeAttribute('data-ig-comment-root');
+    });
+  }).catch(() => {});
+
   const clickInfo = await clickRealCommentButton(page);
-  appendLog('COMMENT_BUTTON_FOUND', { url: postUrl, strategy: clickInfo.strategy, returnFlow: true });
-  appendLog('COMMENT_BUTTON_CLICKED', { url: postUrl, strategy: clickInfo.strategy, returnFlow: true });
+
+  appendLog('COMMENTS_RETURN_COMMENT_BUTTON_FOUND', {
+    url: postUrl,
+    strategy: clickInfo.strategy
+  });
+
+  appendLog('COMMENTS_RETURN_COMMENT_BUTTON_CLICKED', {
+    url: postUrl,
+    strategy: clickInfo.strategy
+  });
 
   const descriptor = await waitForCommentRoot(page);
-  if (!descriptor || !descriptor.rowCount) throw new Error('REPLY_COMMENT_UI_NOT_REOPENED');
+
+  if (!descriptor || !descriptor.rowCount) {
+    throw new Error('REPLY_COMMENT_UI_NOT_REOPENED');
+  }
+
   await markCommentRoot(page, descriptor);
-  return getRootLocator(page);
+
+  const root = await getRootLocator(page);
+
+  const verified =
+    await root.isVisible().catch(() => false);
+
+  if (!verified) {
+    throw new Error('REPLY_COMMENT_UI_NOT_REOPENED');
+  }
+
+  appendLog('COMMENTS_RETURN_REOPENED', {
+    url: postUrl,
+    strategy: clickInfo.strategy
+  });
+
+  return root;
 }
 
 
@@ -2086,6 +2119,8 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
     matchesFound: 0,
     matchesCompleted: 0,
     matchesFailed: 0,
+    successfulDirectMessages: 0,
+    successfulReplies: 0,
     matchItems: [],
     scanRounds: 0
   };
@@ -2175,6 +2210,7 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
 
         await sendDM(dmPage, comment.profilePath, comment.username, dmReply);
         item.dm = 'sent';
+        postLog.successfulDirectMessages++;
         appendLog('DM_SENT', {
           url,
           username: comment.username,
@@ -2210,6 +2246,7 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
         );
 
         item.reply = 'sent';
+        postLog.successfulReplies++;
         item.status = 'done';
         postLog.matchesCompleted++;
 
@@ -2255,6 +2292,8 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
       matchesFound: postLog.matchesFound,
       matchesCompleted: postLog.matchesCompleted,
       matchesFailed: postLog.matchesFailed,
+      successfulDirectMessages: postLog.successfulDirectMessages,
+      successfulReplies: postLog.successfulReplies,
       screenshot: postLog.screenshot,
       failureScreenshot: postLog.failureScreenshot
     });
@@ -2312,7 +2351,9 @@ async function main() {
     commentsScanned: 0,
     matchesFound: 0,
     matchesCompleted: 0,
-    matchesFailed: 0
+    matchesFailed: 0,
+    successfulDirectMessages: 0,
+    successfulReplies: 0
   };
 
   try {
@@ -2327,6 +2368,8 @@ async function main() {
         runLog.matchesFound += postLog.matchesFound;
         runLog.matchesCompleted += postLog.matchesCompleted;
         runLog.matchesFailed += postLog.matchesFailed;
+        runLog.successfulDirectMessages += postLog.successfulDirectMessages;
+        runLog.successfulReplies += postLog.successfulReplies;
       } catch (error) {
         const message = String(error?.message || error);
         runLog.errors.push({ url: postUrls[i], error: message });

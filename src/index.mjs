@@ -1739,24 +1739,38 @@ async function sendMainCommentReply(page, root, username, replyText) {
     el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
   ).catch(() => false);
 
-  if (isNativeInput) {
-    await input.fill(payload);
-  } else {
-    await input.evaluate(el => {
-      if (el instanceof HTMLElement) {
-        el.focus();
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        selection?.removeAllRanges();
-        selection?.addRange(range);
-      }
-    }).catch(() => {});
-
+  const clearAndTypeComposer = async () => {
+    await input.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
     await page.keyboard.press('Control+A').catch(() => {});
     await page.keyboard.press('Backspace').catch(() => {});
-    await page.keyboard.insertText(payload).catch(() => {});
-  }
+    await page.waitForTimeout(80);
+
+    // Instagram's public comment composer is currently a controlled native
+    // INPUT. Use real keyboard input so the same input events are emitted as
+    // when a human types the comment.
+    await input.pressSequentially(payload, {
+      delay: 8,
+      timeout: CLICK_TIMEOUT_MS
+    });
+    await page.waitForTimeout(180);
+  };
+
+  const setNativeValueWithEvents = async () => {
+    await input.evaluate((el, value) => {
+      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+      const proto = Object.getPrototypeOf(el);
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (descriptor?.set) descriptor.set.call(el, value);
+      else el.value = value;
+      el.dispatchEvent(new InputEvent('input', {
+        bubbles: true,
+        inputType: 'insertText',
+        data: value
+      }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }, payload).catch(() => {});
+    await page.waitForTimeout(180);
+  };
 
   async function currentComposerText() {
     return input.evaluate(
@@ -1768,14 +1782,24 @@ async function sendMainCommentReply(page, root, username, replyText) {
     ).catch(() => '');
   }
 
+  // Attempt 1: keyboard path (most reliable for Instagram's React composer).
+  await clearAndTypeComposer().catch(() => {});
   let currentValue = await currentComposerText();
 
+  // Attempt 2: native value setter + input/change events for controlled INPUTs.
+  if (!normalizeText(currentValue).includes(normalizedPayload) && isNativeInput) {
+    await setNativeValueWithEvents();
+    currentValue = await currentComposerText();
+  }
+
+  // Attempt 3: refocus and use insertText after the composer is re-rendered.
   if (!normalizeText(currentValue).includes(normalizedPayload)) {
-    await input.click().catch(() => {});
+    await input.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
     await page.keyboard.press('Control+A').catch(() => {});
     await page.keyboard.press('Backspace').catch(() => {});
+    await page.waitForTimeout(80);
     await page.keyboard.insertText(payload).catch(() => {});
-    await page.waitForTimeout(150);
+    await page.waitForTimeout(180);
     currentValue = await currentComposerText();
   }
 
@@ -1966,11 +1990,50 @@ async function sendMainCommentReply(page, root, username, replyText) {
   }
 
   await sendButton.scrollIntoViewIfNeeded().catch(() => {});
-  await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+
+  // Submit exactly once through the normal human action: one Enter.
+  // If Instagram does not clear the composer, use the already located
+  // Send/Post control as the fallback.
+  await input.press('Enter').catch(() => {});
+  await page.waitForTimeout(500);
+
+  let composerCleared = await page.waitForFunction(
+    composerToken => {
+      const el = document.querySelector(
+        `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
+      );
+      if (!el) return true;
+      const value = 'value' in el
+        ? String(el.value || '')
+        : String(el.textContent || el.innerText || '');
+      return !value.trim();
+    },
+    composerDescriptor.token,
+    { timeout: 2500 }
+  ).then(() => true).catch(() => false);
+
+  if (!composerCleared) {
+    await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+    await page.waitForTimeout(500);
+    composerCleared = await page.waitForFunction(
+      composerToken => {
+        const el = document.querySelector(
+          `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
+        );
+        if (!el) return true;
+        const value = 'value' in el
+          ? String(el.value || '')
+          : String(el.textContent || el.innerText || '');
+        return !value.trim();
+      },
+      composerDescriptor.token,
+      { timeout: 2500 }
+    ).then(() => true).catch(() => false);
+  }
 
   appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
     username: user,
-    method: 'main-composer-send-button',
+    method: composerCleared ? 'enter' : 'main-composer-send-button',
     payload
   });
 

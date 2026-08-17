@@ -1492,7 +1492,7 @@ async function sendReply(page, root, username, profilePath, commentText, replyTe
 
   const beforeStats = await getCommentThreadStats(root, username, commentText);
   if (!beforeStats) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
-  beforeStats.replyTextCount = await root.evaluate((text) => {
+  beforeStats.replyTextCount = await root.evaluate((rootEl, text) => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')

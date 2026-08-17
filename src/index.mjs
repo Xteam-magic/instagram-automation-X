@@ -1485,6 +1485,343 @@ async function verifyReplyIsNested(root, username, commentText, replyText, befor
 }
 
 
+
+async function sendMainCommentReply(page, root, username, replyText) {
+  const textToSend = String(replyText || '').trim();
+  const user = String(username || '').trim().replace(/^@+/, '');
+
+  if (!user || !textToSend) {
+    throw new Error('REPLY_NOT_CONFIRMED');
+  }
+
+  const payload = `@${user} ${textToSend}`.trim();
+  const normalizedPayload = normalizeText(payload);
+
+  appendLog('MAIN_COMMENT_REPLY_INPUT_SEARCH', {
+    username: user,
+    payload
+  });
+
+  // The user requested a deliberate, simple flow after DM:
+  // reopen the post comments, use ONLY the main "Add a comment..." composer,
+  // type "@username <reply text>", then click the Send/Post control beside it.
+  // Do not locate the original comment row and do not click its Reply button.
+  const composer = await page.evaluate(() => {
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.bottom > 0 &&
+        r.right > 0 &&
+        r.top < innerHeight &&
+        r.left < innerWidth
+      );
+    };
+
+    const isMainCommentInput = el => {
+      const placeholder = el.getAttribute('placeholder') || '';
+      const aria = el.getAttribute('aria-label') || '';
+      const title = el.getAttribute('title') || '';
+      const meta = normalizeText(`${placeholder} ${aria} ${title}`);
+      return /add a comment|comment|نظر|دیدگاه|کامنت/i.test(meta);
+    };
+
+    const root = document.querySelector('[data-ig-comment-root="1"]');
+    const roots = root ? [root] : [];
+    roots.push(document);
+
+    const candidates = [];
+
+    for (const scope of roots) {
+      const elements = Array.from(scope.querySelectorAll(
+        'textarea,[contenteditable="true"],[role="textbox"]'
+      ));
+
+      for (const el of elements) {
+        if (!visible(el)) continue;
+
+        const r = el.getBoundingClientRect();
+        const placeholder = el.getAttribute('placeholder') || '';
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        const meta = normalizeText(`${placeholder} ${aria} ${title}`);
+        const mainSignal = /add a comment|comment|نظر|دیدگاه|کامنت/i.test(meta);
+        const bottomSignal = r.bottom > innerHeight * 0.72;
+        const wideSignal = r.width >= 180;
+
+        // Do not accept the inline Reply composer from a comment row.
+        const rowAncestor = el.closest('[data-ig-target-row],[data-ig-reply-target]');
+        if (rowAncestor) continue;
+
+        let score = 0;
+        score += mainSignal ? 500 : 0;
+        score += /add a comment/i.test(meta) ? 250 : 0;
+        score += bottomSignal ? 180 : 0;
+        score += wideSignal ? 80 : 0;
+        score += el.matches('textarea') ? 60 : 0;
+        score += el.getAttribute('contenteditable') === 'true' ? 50 : 0;
+
+        if (mainSignal || (bottomSignal && wideSignal)) {
+          candidates.push({ el, score, rect: r, placeholder, aria, title });
+        }
+      }
+    }
+
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => b.score - a.score || b.rect.bottom - a.rect.bottom);
+    const best = candidates[0];
+    const token = `ig-main-comment-composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.el.setAttribute('data-ig-main-comment-composer', token);
+
+    return {
+      token,
+      score: best.score,
+      rect: {
+        left: best.rect.left,
+        top: best.rect.top,
+        width: best.rect.width,
+        height: best.rect.height
+      },
+      placeholder: best.placeholder,
+      aria: best.aria,
+      title: best.title,
+      tag: best.el.tagName,
+      contenteditable: best.el.getAttribute('contenteditable') || null
+    };
+  });
+
+  if (!composer?.token) {
+    throw new Error('MAIN_COMMENT_INPUT_NOT_FOUND');
+  }
+
+  const selector = `[data-ig-main-comment-composer="${String(composer.token).replace(/"/g, '\\"')}"]`;
+  const input = page.locator(selector).first();
+
+  if (!(await input.isVisible().catch(() => false))) {
+    throw new Error('MAIN_COMMENT_INPUT_NOT_FOUND');
+  }
+
+  await input.scrollIntoViewIfNeeded().catch(() => {});
+  await input.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
+  await page.waitForTimeout(150);
+
+  // Start with an empty main composer. We deliberately do NOT use the row Reply UI.
+  if (await input.evaluate(el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement).catch(() => false)) {
+    await input.fill(payload);
+  } else {
+    await input.evaluate(el => {
+      if (el instanceof HTMLElement) {
+        el.focus();
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+      }
+    }).catch(() => {});
+
+    await page.keyboard.press('Control+A').catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
+    await page.keyboard.insertText(payload).catch(() => {});
+  }
+
+  const currentValue = await input.evaluate(el =>
+    String('value' in el ? el.value : (el.textContent || el.innerText || ''))
+  ).catch(() => '');
+
+  if (!normalizeText(currentValue).includes(normalizedPayload)) {
+    // One deterministic retry for contenteditable React inputs.
+    await input.click().catch(() => {});
+    await page.keyboard.press('Control+A').catch(() => {});
+    await page.keyboard.press('Backspace').catch(() => {});
+    await page.keyboard.insertText(payload).catch(() => {});
+  }
+
+  const finalValue = await input.evaluate(el =>
+    String('value' in el ? el.value : (el.textContent || el.innerText || ''))
+  ).catch(() => '');
+
+  if (!normalizeText(finalValue).includes(normalizedPayload)) {
+    throw new Error('MAIN_COMMENT_INPUT_FILL_FAILED');
+  }
+
+  appendLog('MAIN_COMMENT_REPLY_INPUT_FILLED', {
+    username: user,
+    payload,
+    inputTag: composer.tag,
+    contenteditable: composer.contenteditable
+  });
+
+  // Find the Send/Post button that belongs to the main composer. We do NOT
+  // use page.getByRole(...).last() because other buttons can be present on the page.
+  const sendInfo = await page.evaluate(composerToken => {
+    const input = document.querySelector(
+      `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
+    );
+    if (!input) return null;
+
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.bottom > 0 &&
+        r.right > 0 &&
+        r.top < innerHeight &&
+        r.left < innerWidth
+      );
+    };
+
+    const labelOf = el => normalizeText([
+      el.innerText || '',
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || ''
+    ].join(' '));
+
+    const inputRect = input.getBoundingClientRect();
+    const scopes = [];
+    let scope = input.parentElement;
+
+    for (let i = 0; i < 7 && scope; i += 1, scope = scope.parentElement) {
+      scopes.push(scope);
+    }
+    scopes.push(document);
+
+    const buttons = [];
+
+    for (const current of scopes) {
+      for (const el of Array.from(current.querySelectorAll('button,[role="button"],[type="submit"]'))) {
+        if (!visible(el)) continue;
+        if (el === input) continue;
+
+        const r = el.getBoundingClientRect();
+        const label = labelOf(el);
+        const rightOfInput = r.left >= inputRect.right - 25;
+        const verticallyAdjacent = Math.abs(r.top - inputRect.top) < Math.max(60, inputRect.height * 2.5);
+        const sendNamed = /^(post|send|ارسال|پست)$/i.test(label) || /post|send|ارسال|پست/i.test(label);
+        const small = r.width <= 90 && r.height <= 90;
+
+        let score = 0;
+        score += sendNamed ? 350 : 0;
+        score += rightOfInput ? 160 : 0;
+        score += verticallyAdjacent ? 100 : 0;
+        score += small ? 35 : 0;
+        score -= r.left < inputRect.left - 100 ? 80 : 0;
+
+        if (sendNamed || (rightOfInput && verticallyAdjacent && small)) {
+          buttons.push({ el, score, rect: r, label });
+        }
+      }
+    }
+
+    if (!buttons.length) return null;
+    buttons.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left);
+
+    const best = buttons[0];
+    const token = `ig-main-comment-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.el.setAttribute('data-ig-main-comment-send', token);
+
+    return {
+      token,
+      score: best.score,
+      label: best.label,
+      rect: {
+        left: best.rect.left,
+        top: best.rect.top,
+        width: best.rect.width,
+        height: best.rect.height
+      }
+    };
+  }, composer.token);
+
+  if (!sendInfo?.token) {
+    throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
+  }
+
+  appendLog('MAIN_COMMENT_SEND_BUTTON_FOUND', {
+    username: user,
+    label: sendInfo.label,
+    score: sendInfo.score,
+    rect: sendInfo.rect
+  });
+
+  const sendSelector = `[data-ig-main-comment-send="${String(sendInfo.token).replace(/"/g, '\\"')}"]`;
+  const sendButton = page.locator(sendSelector).first();
+
+  if (!(await sendButton.isVisible().catch(() => false))) {
+    throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
+  }
+
+  await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+  appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
+    username: user,
+    method: 'button',
+    payload
+  });
+
+  // Verify the actual public comment appears. This is deliberately stricter
+  // than merely checking that the input was cleared.
+  const verified = await page.waitForFunction(
+    ({ user, message }) => {
+      const norm = value => String(value || '')
+        .normalize('NFKC')
+        .toLocaleLowerCase('fa')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+        .replace(/[ًٌٍَُِّْـ]/g, '')
+        .replace(/ي/g, 'ی')
+        .replace(/ى/g, 'ی')
+        .replace(/ك/g, 'ک')
+        .replace(/[ۀە]/g, 'ه')
+        .replace(/[أإآ]/g, 'ا')
+        .replace(/ؤ/g, 'و')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const body = norm(document.body?.innerText || '');
+      const expected = norm(`@${user} ${message}`);
+      const expectedWithoutAt = norm(`${user} ${message}`);
+
+      return body.includes(expected) || body.includes(expectedWithoutAt);
+    },
+    { user, message: textToSend },
+    { timeout: 10000 }
+  ).then(() => true).catch(() => false);
+
+  const composerEmpty = await input.evaluate(el =>
+    !String('value' in el ? el.value : (el.textContent || el.innerText || '')).trim()
+  ).catch(() => false);
+
+  if (!verified && !composerEmpty) {
+    throw new Error('REPLY_NOT_CONFIRMED');
+  }
+
+  // A cleared main composer is accepted only as a secondary signal when the
+  // post UI is still open; we intentionally require the send button click above.
+  if (!verified && !composerEmpty) {
+    throw new Error('REPLY_NOT_CONFIRMED');
+  }
+
+  appendLog('MAIN_COMMENT_REPLY_VERIFIED', {
+    username: user,
+    payload,
+    verification: verified ? 'comment-visible' : 'composer-cleared'
+  });
+
+  return true;
+}
+
 async function sendReply(page, root, username, profilePath, commentText, replyText) {
   if (!root) throw new Error('COMMENT_ROW_NOT_FOUND_FOR_MATCH');
   const textToSend = String(replyText || '').trim();
@@ -2233,15 +2570,19 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
         appendLog('REPLY_ATTEMPT', {
           url,
           username: comment.username,
-          keyword: match.keyword
+          keyword: match.keyword,
+          method: 'main-comment-input-mention'
         });
 
-        await sendReply(
+        // FINAL COMMENT FLOW:
+        // After DM succeeds and the post comments are freshly reopened,
+        // do NOT search for the original row and do NOT click its Reply button.
+        // Use the main Add-a-comment composer at the bottom of the comments list
+        // and publish: "@instagram_username <configured reply text>".
+        await sendMainCommentReply(
           page,
           replyRoot,
           comment.username,
-          comment.profilePath,
-          comment.commentText,
           commentReply
         );
 
@@ -2253,7 +2594,8 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
         appendLog('REPLY_SENT', {
           url,
           username: comment.username,
-          keyword: match.keyword
+          keyword: match.keyword,
+          method: 'main-comment-input-mention'
         });
         appendLog('MATCH_COMPLETED', {
           url,

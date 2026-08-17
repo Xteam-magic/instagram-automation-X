@@ -1499,14 +1499,35 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   appendLog('MAIN_COMMENT_REPLY_INPUT_SEARCH', {
     username: user,
-    payload
+    payload,
+    method: 'main-comment-composer-placeholder-and-geometry'
   });
 
-  // The user requested a deliberate, simple flow after DM:
-  // reopen the post comments, use ONLY the main "Add a comment..." composer,
-  // type "@username <reply text>", then click the Send/Post control beside it.
-  // Do not locate the original comment row and do not click its Reply button.
-  const composer = await page.evaluate(() => {
+  /*
+   * IMPORTANT:
+   * The Instagram Web composer in the supplied screenshot is the MAIN
+   * "Add a comment..." field at the very bottom of the Comments panel.
+   * It is NOT necessarily a textarea and the visible placeholder can be a
+   * separate child node rather than a real HTML placeholder attribute.
+   *
+   * Therefore we find it from the visible placeholder text + the geometry of
+   * the bottom composer + a contenteditable/textbox descendant.
+   */
+  const composerDescriptor = await page.evaluate(() => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const visible = el => {
       if (!el) return false;
       const r = el.getBoundingClientRect();
@@ -1524,85 +1545,184 @@ async function sendMainCommentReply(page, root, username, replyText) {
       );
     };
 
-    const isMainCommentInput = el => {
-      const placeholder = el.getAttribute('placeholder') || '';
-      const aria = el.getAttribute('aria-label') || '';
-      const title = el.getAttribute('title') || '';
-      const meta = normalizeText(`${placeholder} ${aria} ${title}`);
-      return /add a comment|comment|نظر|دیدگاه|کامنت/i.test(meta);
-    };
+    const isRowComposer = el => Boolean(
+      el.closest('[data-ig-target-row],[data-ig-reply-target]')
+    );
 
-    const root = document.querySelector('[data-ig-comment-root="1"]');
-    const roots = root ? [root] : [];
-    roots.push(document);
+    const roots = [];
+    const markedRoot = document.querySelector('[data-ig-comment-root="1"]');
+    if (markedRoot) roots.push(markedRoot);
 
-    const candidates = [];
+    for (const dialog of Array.from(document.querySelectorAll('[role="dialog"]'))) {
+      if (visible(dialog)) roots.push(dialog);
+    }
+
+    if (!roots.length) roots.push(document);
+
+    const inputCandidates = [];
 
     for (const scope of roots) {
-      const elements = Array.from(scope.querySelectorAll(
-        'textarea,[contenteditable="true"],[role="textbox"]'
-      ));
-
-      for (const el of elements) {
-        if (!visible(el)) continue;
+      for (const el of Array.from(scope.querySelectorAll(
+        'textarea,[contenteditable="true"],[role="textbox"],input:not([type="hidden"])'
+      ))) {
+        if (!visible(el) || isRowComposer(el)) continue;
 
         const r = el.getBoundingClientRect();
-        const placeholder = el.getAttribute('placeholder') || '';
-        const aria = el.getAttribute('aria-label') || '';
-        const title = el.getAttribute('title') || '';
-        const meta = normalizeText(`${placeholder} ${aria} ${title}`);
-        const mainSignal = /add a comment|comment|نظر|دیدگاه|کامنت/i.test(meta);
-        const bottomSignal = r.bottom > innerHeight * 0.72;
-        const wideSignal = r.width >= 180;
+        const meta = normalize([
+          el.getAttribute('placeholder'),
+          el.getAttribute('aria-label'),
+          el.getAttribute('title'),
+          el.getAttribute('role')
+        ].join(' '));
 
-        // Do not accept the inline Reply composer from a comment row.
-        const rowAncestor = el.closest('[data-ig-target-row],[data-ig-reply-target]');
-        if (rowAncestor) continue;
+        let ancestor = el;
+        let ancestorText = '';
+        let depth = 0;
+
+        while (ancestor && depth < 7) {
+          const raw = String(ancestor.innerText || '').trim();
+          if (raw) ancestorText += ` ${raw}`;
+          ancestor = ancestor.parentElement;
+          depth += 1;
+        }
+
+        const normalizedAncestorText = normalize(ancestorText);
+        const exactPlaceholder = /add a comment|افزودن نظر|نظر خود را بنویس|کامنت/i.test(meta);
+        const visiblePlaceholderText = /add a comment|افزودن نظر|نظر خود را بنویس|کامنت/i.test(normalizedAncestorText);
+        const bottom = r.bottom >= innerHeight * 0.78;
+        const wide = r.width >= 100;
+        const rightPanel = r.left >= innerWidth * 0.55;
+        const contentEditable = el.getAttribute('contenteditable') === 'true';
+        const textarea = el.tagName === 'TEXTAREA';
 
         let score = 0;
-        score += mainSignal ? 500 : 0;
-        score += /add a comment/i.test(meta) ? 250 : 0;
-        score += bottomSignal ? 180 : 0;
-        score += wideSignal ? 80 : 0;
-        score += el.matches('textarea') ? 60 : 0;
-        score += el.getAttribute('contenteditable') === 'true' ? 50 : 0;
+        score += exactPlaceholder ? 1000 : 0;
+        score += visiblePlaceholderText ? 700 : 0;
+        score += bottom ? 350 : 0;
+        score += rightPanel ? 220 : 0;
+        score += wide ? 180 : 0;
+        score += textarea ? 70 : 0;
+        score += contentEditable ? 90 : 0;
+        score += el.getAttribute('role') === 'textbox' ? 50 : 0;
+        score -= r.left < innerWidth * 0.45 ? 400 : 0;
+        score -= isRowComposer(el) ? 10000 : 0;
 
-        if (mainSignal || (bottomSignal && wideSignal)) {
-          candidates.push({ el, score, rect: r, placeholder, aria, title });
+        inputCandidates.push({
+          el,
+          score,
+          rect: {
+            left: r.left,
+            top: r.top,
+            width: r.width,
+            height: r.height
+          },
+          meta,
+          ancestorText: normalizedAncestorText.slice(0, 500)
+        });
+      }
+    }
+
+    /*
+     * Strong fallback: find the visible literal "Add a comment..." element,
+     * then walk upward until a textbox/contenteditable appears in the same
+     * composer container.
+     */
+    const placeholderNodes = [];
+    for (const scope of roots) {
+      for (const el of Array.from(scope.querySelectorAll('div,span,p'))) {
+        if (!visible(el)) continue;
+        const text = normalize(el.textContent || '');
+        if (!/^(add a comment\.\.\.|add a comment…|add a comment)$/i.test(text)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.bottom < innerHeight * 0.70) continue;
+        placeholderNodes.push({ el, rect: r });
+      }
+    }
+
+    placeholderNodes.sort(
+      (a, b) => b.rect.bottom - a.rect.bottom || b.rect.width - a.rect.width
+    );
+
+    for (const ph of placeholderNodes.slice(0, 5)) {
+      let node = ph.el;
+      for (let depth = 0; depth < 7 && node; depth += 1, node = node.parentElement) {
+        const inputs = Array.from(
+          node.querySelectorAll(
+            'textarea,[contenteditable="true"],[role="textbox"],input:not([type="hidden"])'
+          )
+        ).filter(visible).filter(el => !isRowComposer(el));
+
+        for (const input of inputs) {
+          const r = input.getBoundingClientRect();
+          if (r.bottom < innerHeight * 0.70 || r.width < 100) continue;
+
+          inputCandidates.push({
+            el: input,
+            score: 1600 - depth * 25,
+            rect: {
+              left: r.left,
+              top: r.top,
+              width: r.width,
+              height: r.height
+            },
+            meta: normalize([
+              input.getAttribute('placeholder'),
+              input.getAttribute('aria-label'),
+              input.getAttribute('title'),
+              input.getAttribute('role')
+            ].join(' ')),
+            ancestorText: normalize(node.innerText || '').slice(0, 500),
+            viaPlaceholder: true
+          });
         }
       }
     }
 
-    if (!candidates.length) return null;
+    if (!inputCandidates.length) return null;
 
-    candidates.sort((a, b) => b.score - a.score || b.rect.bottom - a.rect.bottom);
-    const best = candidates[0];
+    inputCandidates.sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.rect.bottom - a.rect.bottom ||
+        b.rect.width - a.rect.width
+    );
+
+    const best = inputCandidates[0];
     const token = `ig-main-comment-composer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     best.el.setAttribute('data-ig-main-comment-composer', token);
 
     return {
       token,
       score: best.score,
-      rect: {
-        left: best.rect.left,
-        top: best.rect.top,
-        width: best.rect.width,
-        height: best.rect.height
-      },
-      placeholder: best.placeholder,
-      aria: best.aria,
-      title: best.title,
+      viaPlaceholder: Boolean(best.viaPlaceholder),
+      meta: best.meta,
+      ancestorText: best.ancestorText,
       tag: best.el.tagName,
-      contenteditable: best.el.getAttribute('contenteditable') || null
+      contenteditable: best.el.getAttribute('contenteditable') || null,
+      role: best.el.getAttribute('role') || null,
+      placeholder: best.el.getAttribute('placeholder') || null,
+      aria: best.el.getAttribute('aria-label') || null,
+      rect: best.rect
     };
   });
 
-  if (!composer?.token) {
+  if (!composerDescriptor?.token) {
     throw new Error('MAIN_COMMENT_INPUT_NOT_FOUND');
   }
 
-  const selector = `[data-ig-main-comment-composer="${String(composer.token).replace(/"/g, '\\"')}"]`;
-  const input = page.locator(selector).first();
+  appendLog('MAIN_COMMENT_INPUT_FOUND', {
+    username: user,
+    score: composerDescriptor.score,
+    viaPlaceholder: composerDescriptor.viaPlaceholder,
+    tag: composerDescriptor.tag,
+    contenteditable: composerDescriptor.contenteditable,
+    role: composerDescriptor.role,
+    placeholder: composerDescriptor.placeholder,
+    rect: composerDescriptor.rect
+  });
+
+  const inputSelector = `[data-ig-main-comment-composer="${String(composerDescriptor.token).replace(/"/g, '\\"')}"]`;
+  const input = page.locator(inputSelector).first();
 
   if (!(await input.isVisible().catch(() => false))) {
     throw new Error('MAIN_COMMENT_INPUT_NOT_FOUND');
@@ -1610,10 +1730,16 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   await input.scrollIntoViewIfNeeded().catch(() => {});
   await input.click({ timeout: CLICK_TIMEOUT_MS }).catch(() => {});
-  await page.waitForTimeout(150);
+  await page.waitForTimeout(200);
 
-  // Start with an empty main composer. We deliberately do NOT use the row Reply UI.
-  if (await input.evaluate(el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement).catch(() => false)) {
+  /* Clear the main public comment field and insert EXACTLY:
+   * @instagram-user-id + one space + configured reply text
+   */
+  const isNativeInput = await input.evaluate(
+    el => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement
+  ).catch(() => false);
+
+  if (isNativeInput) {
     await input.fill(payload);
   } else {
     await input.evaluate(el => {
@@ -1632,36 +1758,62 @@ async function sendMainCommentReply(page, root, username, replyText) {
     await page.keyboard.insertText(payload).catch(() => {});
   }
 
-  const currentValue = await input.evaluate(el =>
-    String('value' in el ? el.value : (el.textContent || el.innerText || ''))
-  ).catch(() => '');
+  async function currentComposerText() {
+    return input.evaluate(
+      el => String(
+        'value' in el
+          ? el.value
+          : (el.textContent || el.innerText || '')
+      )
+    ).catch(() => '');
+  }
+
+  let currentValue = await currentComposerText();
 
   if (!normalizeText(currentValue).includes(normalizedPayload)) {
-    // One deterministic retry for contenteditable React inputs.
     await input.click().catch(() => {});
     await page.keyboard.press('Control+A').catch(() => {});
     await page.keyboard.press('Backspace').catch(() => {});
     await page.keyboard.insertText(payload).catch(() => {});
+    await page.waitForTimeout(150);
+    currentValue = await currentComposerText();
   }
 
-  const finalValue = await input.evaluate(el =>
-    String('value' in el ? el.value : (el.textContent || el.innerText || ''))
-  ).catch(() => '');
-
-  if (!normalizeText(finalValue).includes(normalizedPayload)) {
+  if (!normalizeText(currentValue).includes(normalizedPayload)) {
     throw new Error('MAIN_COMMENT_INPUT_FILL_FAILED');
   }
 
   appendLog('MAIN_COMMENT_REPLY_INPUT_FILLED', {
     username: user,
     payload,
-    inputTag: composer.tag,
-    contenteditable: composer.contenteditable
+    inputTag: composerDescriptor.tag,
+    contenteditable: composerDescriptor.contenteditable
   });
 
-  // Find the Send/Post button that belongs to the main composer. We do NOT
-  // use page.getByRole(...).last() because other buttons can be present on the page.
+  /*
+   * The Send icon may have NO text, NO aria-label and NO title until the
+   * composer has text. Find it by its relationship to the input:
+   * - same composer / nearby ancestors
+   * - visible
+   * - immediately to the RIGHT of the input
+   * - vertically aligned
+   * - small icon/button
+   */
   const sendInfo = await page.evaluate(composerToken => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const input = document.querySelector(
       `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
     );
@@ -1684,67 +1836,116 @@ async function sendMainCommentReply(page, root, username, replyText) {
       );
     };
 
-    const labelOf = el => normalizeText([
+    const labelOf = el => normalize([
       el.innerText || '',
       el.getAttribute('aria-label') || '',
-      el.getAttribute('title') || ''
+      el.getAttribute('title') || '',
+      el.getAttribute('data-testid') || ''
     ].join(' '));
 
     const inputRect = input.getBoundingClientRect();
     const scopes = [];
     let scope = input.parentElement;
 
-    for (let i = 0; i < 7 && scope; i += 1, scope = scope.parentElement) {
+    for (let i = 0; i < 8 && scope; i += 1, scope = scope.parentElement) {
       scopes.push(scope);
     }
-    scopes.push(document);
 
-    const buttons = [];
+    if (input.closest('[role="dialog"]')) {
+      scopes.push(input.closest('[role="dialog"]'));
+    }
+
+    const candidates = [];
+    const seen = new Set();
 
     for (const current of scopes) {
-      for (const el of Array.from(current.querySelectorAll('button,[role="button"],[type="submit"]'))) {
-        if (!visible(el)) continue;
-        if (el === input) continue;
+      if (!current) continue;
 
-        const r = el.getBoundingClientRect();
-        const label = labelOf(el);
-        const rightOfInput = r.left >= inputRect.right - 25;
-        const verticallyAdjacent = Math.abs(r.top - inputRect.top) < Math.max(60, inputRect.height * 2.5);
-        const sendNamed = /^(post|send|ارسال|پست)$/i.test(label) || /post|send|ارسال|پست/i.test(label);
-        const small = r.width <= 90 && r.height <= 90;
+      for (const el of Array.from(
+        current.querySelectorAll(
+          'button,[role="button"],[type="submit"],svg'
+        )
+      )) {
+        const clickTarget =
+          el.closest('button,[role="button"],[type="submit"]') || el;
+
+        if (!clickTarget || seen.has(clickTarget)) continue;
+        seen.add(clickTarget);
+        if (!visible(clickTarget)) continue;
+        if (clickTarget === input) continue;
+
+        const r = clickTarget.getBoundingClientRect();
+        const label = labelOf(clickTarget);
+        const rightGap = r.left - inputRect.right;
+        const verticalGap = Math.abs(
+          r.top + r.height / 2 -
+          (inputRect.top + inputRect.height / 2)
+        );
+
+        const isExplicitSend =
+          /\b(post|send|ارسال|پست)\b/i.test(label);
+
+        const isSmallIcon =
+          r.width <= 90 &&
+          r.height <= 90;
+
+        const isRightOfInput =
+          rightGap >= -15 &&
+          rightGap <= 120;
+
+        const isAligned =
+          verticalGap <= Math.max(70, inputRect.height * 3);
 
         let score = 0;
-        score += sendNamed ? 350 : 0;
-        score += rightOfInput ? 160 : 0;
-        score += verticallyAdjacent ? 100 : 0;
-        score += small ? 35 : 0;
-        score -= r.left < inputRect.left - 100 ? 80 : 0;
+        score += isExplicitSend ? 700 : 0;
+        score += isRightOfInput ? 500 : 0;
+        score += isAligned ? 280 : 0;
+        score += isSmallIcon ? 120 : 0;
+        score += clickTarget.querySelectorAll('svg').length ? 80 : 0;
+        score -= r.left < inputRect.left - 80 ? 250 : 0;
+        score -= r.top < inputRect.top - 100 ? 150 : 0;
 
-        if (sendNamed || (rightOfInput && verticallyAdjacent && small)) {
-          buttons.push({ el, score, rect: r, label });
+        if (
+          isExplicitSend ||
+          (isRightOfInput && isAligned && isSmallIcon)
+        ) {
+          candidates.push({
+            el: clickTarget,
+            score,
+            label,
+            rect: {
+              left: r.left,
+              top: r.top,
+              width: r.width,
+              height: r.height
+            }
+          });
         }
       }
     }
 
-    if (!buttons.length) return null;
-    buttons.sort((a, b) => b.score - a.score || b.rect.left - a.rect.left);
+    if (!candidates.length) return null;
 
-    const best = buttons[0];
+    candidates.sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.rect.left - a.rect.left
+    );
+
+    const best = candidates[0];
     const token = `ig-main-comment-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    best.el.setAttribute('data-ig-main-comment-send', token);
+    best.el.setAttribute(
+      'data-ig-main-comment-send',
+      token
+    );
 
     return {
       token,
       score: best.score,
       label: best.label,
-      rect: {
-        left: best.rect.left,
-        top: best.rect.top,
-        width: best.rect.width,
-        height: best.rect.height
-      }
+      rect: best.rect
     };
-  }, composer.token);
+  }, composerDescriptor.token);
 
   if (!sendInfo?.token) {
     throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
@@ -1764,17 +1965,28 @@ async function sendMainCommentReply(page, root, username, replyText) {
     throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
   }
 
+  await sendButton.scrollIntoViewIfNeeded().catch(() => {});
   await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+
   appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
     username: user,
-    method: 'button',
+    method: 'main-composer-send-button',
     payload
   });
 
-  // Verify the actual public comment appears. This is deliberately stricter
-  // than merely checking that the input was cleared.
+  /*
+   * Verify by looking for the exact payload in the comment panel AFTER the
+   * send. The panel may virtualize rows, so first force it to the bottom.
+   */
+  await root.evaluate(el => {
+    el.scrollTop = Math.max(
+      0,
+      el.scrollHeight - el.clientHeight
+    );
+  }).catch(() => {});
+
   const verified = await page.waitForFunction(
-    ({ user, message }) => {
+    ({ username: verifyUser, replyText: verifyText }) => {
       const norm = value => String(value || '')
         .normalize('NFKC')
         .toLocaleLowerCase('fa')
@@ -1789,34 +2001,50 @@ async function sendMainCommentReply(page, root, username, replyText) {
         .replace(/\s+/g, ' ')
         .trim();
 
-      const body = norm(document.body?.innerText || '');
-      const expected = norm(`@${user} ${message}`);
-      const expectedWithoutAt = norm(`${user} ${message}`);
+      const expected = norm(`@${verifyUser} ${verifyText}`);
+      const expectedWithoutAt = norm(`${verifyUser} ${verifyText}`);
+      const rootEl = document.querySelector('[data-ig-comment-root="1"]') || document;
+      const rootText = norm(rootEl.innerText || '');
 
-      return body.includes(expected) || body.includes(expectedWithoutAt);
+      return (
+        rootText.includes(expected) ||
+        rootText.includes(expectedWithoutAt)
+      );
     },
-    { user, message: textToSend },
+    { username: user, replyText: textToSend },
     { timeout: 10000 }
   ).then(() => true).catch(() => false);
 
-  const composerEmpty = await input.evaluate(el =>
-    !String('value' in el ? el.value : (el.textContent || el.innerText || '')).trim()
-  ).catch(() => false);
+  if (!verified) {
+    /*
+     * Secondary confirmation: the main composer became empty AFTER the send
+     * button was explicitly clicked. This is accepted only after the exact
+     * send button was found/clicked and the UI is still on the Comments panel.
+     */
+    const cleared = await page.waitForFunction(
+      composerToken => {
+        const el = document.querySelector(
+          `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
+        );
+        if (!el) return true;
+        const value = 'value' in el
+          ? String(el.value || '')
+          : String(el.textContent || el.innerText || '');
+        return !value.trim();
+      },
+      composerDescriptor.token,
+      { timeout: 5000 }
+    ).then(() => true).catch(() => false);
 
-  if (!verified && !composerEmpty) {
-    throw new Error('REPLY_NOT_CONFIRMED');
-  }
-
-  // A cleared main composer is accepted only as a secondary signal when the
-  // post UI is still open; we intentionally require the send button click above.
-  if (!verified && !composerEmpty) {
-    throw new Error('REPLY_NOT_CONFIRMED');
+    if (!cleared) {
+      throw new Error('REPLY_NOT_CONFIRMED');
+    }
   }
 
   appendLog('MAIN_COMMENT_REPLY_VERIFIED', {
     username: user,
     payload,
-    verification: verified ? 'comment-visible' : 'composer-cleared'
+    verification: verified ? 'comment-visible' : 'composer-cleared-after-send'
   });
 
   return true;

@@ -194,6 +194,102 @@ async function dismissCommonPopups(page) {
   }
 }
 
+async function dismissSaveModalIfPresent(page) {
+  if (!page || page.isClosed()) return false;
+
+  // Instagram can open a "Save" sheet immediately after the comment action.
+  // It is a blocking UI layer, not the comments panel. Close ONLY that sheet
+  // through its own X control so the rest of the existing comment/DM flow is
+  // untouched.
+  const saveText = page.getByText(/to save|save (this|the) post|save .*post|easy to find later/i).first();
+  if (!(await saveText.isVisible().catch(() => false))) return false;
+
+  const info = await page.evaluate(() => {
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.right > 0 &&
+        r.bottom > 0 &&
+        r.left < innerWidth &&
+        r.top < innerHeight
+      );
+    };
+
+    const textNodes = Array.from(document.querySelectorAll('div,span,p')).filter(visible).filter(el => {
+      const text = (el.innerText || '').trim();
+      return /to save|save (this|the) post|save .*post|easy to find later/i.test(text);
+    });
+
+    let sheet = null;
+    let bestArea = Infinity;
+    for (const node of textNodes) {
+      let current = node;
+      for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+        const r = current.getBoundingClientRect();
+        const s = getComputedStyle(current);
+        if (!visible(current)) continue;
+        if (!/fixed|absolute|sticky/.test(s.position)) continue;
+        if (r.width < 220 || r.height < 140) continue;
+        const area = r.width * r.height;
+        if (area < bestArea) {
+          bestArea = area;
+          sheet = current;
+        }
+      }
+    }
+
+    if (!sheet) return null;
+
+    const sr = sheet.getBoundingClientRect();
+    const controls = Array.from(sheet.querySelectorAll('button,[role="button"],a')).filter(visible);
+    let best = null;
+
+    for (const el of controls) {
+      const r = el.getBoundingClientRect();
+      if (r.width > 90 || r.height > 90) continue;
+
+      const aria = el.getAttribute('aria-label') || '';
+      const title = el.getAttribute('title') || '';
+      const text = (el.innerText || '').trim();
+      const label = `${aria} ${title} ${text}`.trim();
+      const isClose = /close|dismiss|cancel|بستن|لغو/i.test(label) || /^[×✕✖✗x]$/i.test(text);
+      if (!isClose) continue;
+
+      const nearTop = Math.abs(r.top - sr.top) <= 90;
+      const nearRight = Math.abs((r.left + r.width) - sr.right) <= 90;
+      if (!nearTop || !nearRight) continue;
+
+      const token = `ig-save-modal-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      el.setAttribute('data-ig-save-modal-close', token);
+      best = { token };
+      break;
+    }
+
+    return best;
+  }).catch(() => null);
+
+  if (!info?.token) return false;
+
+  const closeButton = page.locator(
+    `[data-ig-save-modal-close="${String(info.token).replace(/"/g, '\\"')}"]`
+  ).first();
+
+  if (!(await closeButton.isVisible().catch(() => false))) return false;
+
+  const closed = await safeClick(closeButton, 1500);
+  if (closed) {
+    await page.waitForTimeout(300).catch(() => {});
+  }
+  return closed;
+}
+
 async function dismissTransientOverlay(page) {
   if (!page || page.isClosed()) return false;
 
@@ -534,6 +630,8 @@ async function clickRealCommentButton(page) {
       await page.waitForTimeout(300);
       continue;
     }
+
+    await dismissSaveModalIfPresent(page);
 
     const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 6000));
     if (verified) {

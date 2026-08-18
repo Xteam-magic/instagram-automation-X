@@ -1815,13 +1815,29 @@ async function sendMainCommentReply(page, root, username, replyText) {
   });
 
   /*
-   * IMPORTANT: Instagram's public comment composer shows a blue
-   * "Post" button immediately to the RIGHT of the input once text exists.
-   * Do not use Enter here and do not choose a generic Send/submit control.
-   * We explicitly locate the visible blue Post control belonging to this
-   * composer and click that exact control once.
+   * The Send icon may have NO text, NO aria-label and NO title until the
+   * composer has text. Find it by its relationship to the input:
+   * - same composer / nearby ancestors
+   * - visible
+   * - immediately to the RIGHT of the input
+   * - vertically aligned
+   * - small icon/button
    */
   const sendInfo = await page.evaluate(composerToken => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/[ًٌٍَُِّْـ]/g, '')
+      .replace(/ي/g, 'ی')
+      .replace(/ى/g, 'ی')
+      .replace(/ك/g, 'ک')
+      .replace(/[ۀە]/g, 'ه')
+      .replace(/[أإآ]/g, 'ا')
+      .replace(/ؤ/g, 'و')
+      .replace(/\s+/g, ' ')
+      .trim();
+
     const input = document.querySelector(
       `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
     );
@@ -1844,84 +1860,114 @@ async function sendMainCommentReply(page, root, username, replyText) {
       );
     };
 
+    const labelOf = el => normalize([
+      el.innerText || '',
+      el.getAttribute('aria-label') || '',
+      el.getAttribute('title') || '',
+      el.getAttribute('data-testid') || ''
+    ].join(' '));
+
     const inputRect = input.getBoundingClientRect();
+    const scopes = [];
+    let scope = input.parentElement;
+
+    for (let i = 0; i < 8 && scope; i += 1, scope = scope.parentElement) {
+      scopes.push(scope);
+    }
+
+    if (input.closest('[role="dialog"]')) {
+      scopes.push(input.closest('[role="dialog"]'));
+    }
+
     const candidates = [];
     const seen = new Set();
 
-    // Search the immediate composer ancestry first, then the visible dialog.
-    const scopes = [];
-    let node = input.parentElement;
-    for (let i = 0; i < 8 && node; i += 1, node = node.parentElement) {
-      scopes.push(node);
-    }
-    const dialog = input.closest('[role="dialog"]');
-    if (dialog) scopes.push(dialog);
-    if (!scopes.length) scopes.push(document);
+    for (const current of scopes) {
+      if (!current) continue;
 
-    for (const scope of scopes) {
-      for (const el of Array.from(scope.querySelectorAll('button,[role="button"]'))) {
-        const target = el.closest('button,[role="button"]') || el;
-        if (!target || seen.has(target)) continue;
-        seen.add(target);
-        if (!visible(target)) continue;
+      for (const el of Array.from(
+        current.querySelectorAll(
+          'button,[role="button"],[type="submit"],svg'
+        )
+      )) {
+        const clickTarget =
+          el.closest('button,[role="button"],[type="submit"]') || el;
 
-        const label = String(
-          target.innerText ||
-          target.textContent ||
-          target.getAttribute('aria-label') ||
-          target.getAttribute('title') ||
-          ''
-        ).trim();
+        if (!clickTarget || seen.has(clickTarget)) continue;
+        seen.add(clickTarget);
+        if (!visible(clickTarget)) continue;
+        if (clickTarget === input) continue;
 
-        // Exact visible caption required. Avoid matching strings such as
-        // "Post to..." or other page controls.
-        if (label !== 'Post') continue;
-
-        const r = target.getBoundingClientRect();
+        const r = clickTarget.getBoundingClientRect();
+        const label = labelOf(clickTarget);
         const rightGap = r.left - inputRect.right;
-        const centerDelta = Math.abs(
-          (r.top + r.height / 2) - (inputRect.top + inputRect.height / 2)
+        const verticalGap = Math.abs(
+          r.top + r.height / 2 -
+          (inputRect.top + inputRect.height / 2)
         );
 
-        // The real blue Post button is immediately to the right of the
-        // comment input. Keep this geometry strict so another Post control
-        // elsewhere in Instagram can never win.
-        if (rightGap < -20 || rightGap > 140) continue;
-        if (centerDelta > Math.max(70, inputRect.height * 3)) continue;
-        if (r.width < 25 || r.height < 15 || r.width > 120 || r.height > 80) continue;
+        const isExplicitSend =
+          /\b(post|send|ارسال|پست)\b/i.test(label);
 
-        const style = getComputedStyle(target);
-        const clickable =
-          style.pointerEvents !== 'none' &&
-          target.getAttribute('aria-disabled') !== 'true' &&
-          !target.hasAttribute('disabled');
-        if (!clickable) continue;
+        const isSmallIcon =
+          r.width <= 90 &&
+          r.height <= 90;
 
-        let score = 2000;
-        score -= Math.max(0, rightGap) * 4;
-        score -= centerDelta * 6;
-        score += r.width <= 80 ? 50 : 0;
+        const isRightOfInput =
+          rightGap >= -15 &&
+          rightGap <= 120;
 
-        candidates.push({
-          el: target,
-          score,
-          label,
-          rect: {
-            left: r.left,
-            top: r.top,
-            width: r.width,
-            height: r.height
-          }
-        });
+        const isAligned =
+          verticalGap <= Math.max(70, inputRect.height * 3);
+
+        let score = 0;
+        score += isExplicitSend ? 700 : 0;
+        score += isRightOfInput ? 500 : 0;
+        score += isAligned ? 280 : 0;
+        score += isSmallIcon ? 120 : 0;
+        score += clickTarget.querySelectorAll('svg').length ? 80 : 0;
+        score -= r.left < inputRect.left - 80 ? 250 : 0;
+        score -= r.top < inputRect.top - 100 ? 150 : 0;
+
+        if (
+          isExplicitSend ||
+          (isRightOfInput && isAligned && isSmallIcon)
+        ) {
+          candidates.push({
+            el: clickTarget,
+            score,
+            label,
+            rect: {
+              left: r.left,
+              top: r.top,
+              width: r.width,
+              height: r.height
+            }
+          });
+        }
       }
     }
 
     if (!candidates.length) return null;
-    candidates.sort((a, b) => b.score - a.score);
 
-    const best = candidates[0];
-    const token = `ig-main-comment-post-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    best.el.setAttribute('data-ig-main-comment-post', token);
+    // Prefer Instagram's visible blue "Post" button when present.
+    // Keep the existing candidate discovery and geometry unchanged.
+    const exactPost = candidates.find(candidate =>
+      /^post$/i.test(String(candidate.label || '').trim())
+    );
+
+    candidates.sort(
+      (a, b) =>
+        b.score - a.score ||
+        b.rect.left - a.rect.left
+    );
+
+    const best = exactPost || candidates[0];
+    const token = `ig-main-comment-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.el.setAttribute(
+      'data-ig-main-comment-send',
+      token
+    );
 
     return {
       token,
@@ -1942,7 +1988,7 @@ async function sendMainCommentReply(page, root, username, replyText) {
     rect: sendInfo.rect
   });
 
-  const sendSelector = `[data-ig-main-comment-post="${String(sendInfo.token).replace(/"/g, '\\"')}"]`;
+  const sendSelector = `[data-ig-main-comment-send="${String(sendInfo.token).replace(/"/g, '\\"')}"]`;
   const sendButton = page.locator(sendSelector).first();
 
   if (!(await sendButton.isVisible().catch(() => false))) {
@@ -1951,13 +1997,11 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   await sendButton.scrollIntoViewIfNeeded().catch(() => {});
 
-  // IMPORTANT: click the exact blue "Post" button. Do NOT press Enter.
+  // Submit exactly once by clicking the located Instagram "Post" button.
+  // Do not press Enter here.
   await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
   await page.waitForTimeout(700);
 
-  // Instagram may re-render the composer immediately after posting. The
-  // first confirmation is that the composer is empty/removed. The second
-  // confirmation below checks that the exact payload is visible in comments.
   const composerCleared = await page.waitForFunction(
     composerToken => {
       const el = document.querySelector(

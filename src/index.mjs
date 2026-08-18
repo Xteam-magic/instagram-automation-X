@@ -1950,19 +1950,13 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
     if (!candidates.length) return null;
 
-    // Prefer Instagram's visible blue "Post" button when present.
-    // Keep the existing candidate discovery and geometry unchanged.
-    const exactPost = candidates.find(candidate =>
-      /^post$/i.test(String(candidate.label || '').trim())
-    );
-
     candidates.sort(
       (a, b) =>
         b.score - a.score ||
         b.rect.left - a.rect.left
     );
 
-    const best = exactPost || candidates[0];
+    const best = candidates[0];
     const token = `ig-main-comment-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     best.el.setAttribute(
       'data-ig-main-comment-send',
@@ -1997,12 +1991,13 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   await sendButton.scrollIntoViewIfNeeded().catch(() => {});
 
-  // Submit exactly once by clicking the located Instagram "Post" button.
-  // Do not press Enter here.
-  await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
-  await page.waitForTimeout(700);
+  // Submit exactly once through the normal human action: one Enter.
+  // If Instagram does not clear the composer, use the already located
+  // Send/Post control as the fallback.
+  await input.press('Enter').catch(() => {});
+  await page.waitForTimeout(500);
 
-  const composerCleared = await page.waitForFunction(
+  let composerCleared = await page.waitForFunction(
     composerToken => {
       const el = document.querySelector(
         `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
@@ -2014,14 +2009,32 @@ async function sendMainCommentReply(page, root, username, replyText) {
       return !value.trim();
     },
     composerDescriptor.token,
-    { timeout: 5000 }
+    { timeout: 2500 }
   ).then(() => true).catch(() => false);
+
+  if (!composerCleared) {
+    await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+    await page.waitForTimeout(500);
+    composerCleared = await page.waitForFunction(
+      composerToken => {
+        const el = document.querySelector(
+          `[data-ig-main-comment-composer="${CSS.escape(composerToken)}"]`
+        );
+        if (!el) return true;
+        const value = 'value' in el
+          ? String(el.value || '')
+          : String(el.textContent || el.innerText || '');
+        return !value.trim();
+      },
+      composerDescriptor.token,
+      { timeout: 2500 }
+    ).then(() => true).catch(() => false);
+  }
 
   appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
     username: user,
-    method: 'main-comment-post-button',
-    payload,
-    composerCleared
+    method: composerCleared ? 'enter' : 'main-composer-send-button',
+    payload
   });
 
   /*

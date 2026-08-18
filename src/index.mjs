@@ -195,22 +195,119 @@ async function dismissCommonPopups(page) {
 }
 
 async function dismissTransientOverlay(page) {
-  if (!page || page.isClosed()) return;
+  if (!page || page.isClosed()) return false;
 
+  let closed = false;
+
+  // First try the browser-level Escape action. This is the least invasive
+  // way to dismiss a transient sheet/dialog when Instagram supports it.
   await page.keyboard.press('Escape').catch(() => {});
-  await page.waitForTimeout(250).catch(() => {});
+  await page.waitForTimeout(180).catch(() => {});
 
-  const closeCandidates = [
-    page.getByRole('button', { name: /Close|Dismiss|Back|بستن|بازگشت/i }).first(),
-    page.locator('button[aria-label*="Close"],button[aria-label*="بستن"],button[title*="Close"],button[title*="بستن"]').first()
+  const semanticCloseCandidates = [
+    page.getByRole('button', { name: /Close|Dismiss|Cancel|بستن|لغو/i }).first(),
+    page.locator(
+      'button[aria-label*="Close" i],button[aria-label*="Dismiss" i],button[aria-label*="Cancel" i],button[aria-label*="بستن" i],button[aria-label*="لغو" i],button[title*="Close" i],button[title*="Dismiss" i],button[title*="Cancel" i],button[title*="بستن" i],button[title*="لغو" i]'
+    ).first()
   ];
 
-  for (const candidate of closeCandidates) {
+  for (const candidate of semanticCloseCandidates) {
     if (await candidate.isVisible().catch(() => false)) {
-      await safeClick(candidate, 700);
-      await page.waitForTimeout(200).catch(() => {});
+      if (await safeClick(candidate, 900)) {
+        closed = true;
+        await page.waitForTimeout(220).catch(() => {});
+        break;
+      }
     }
   }
+
+  if (closed) return true;
+
+  // Instagram sometimes renders a blocking sheet without a usable aria-label.
+  // In that case the only reliable affordance is the small X at the sheet's
+  // upper-right corner. Limit this heuristic to dialog/modal-like containers
+  // so we never click an unrelated icon in the post action rail.
+  const closeInfo = await page.evaluate(() => {
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.right > 0 &&
+        r.bottom > 0 &&
+        r.left < innerWidth &&
+        r.top < innerHeight
+      );
+    };
+
+    const overlays = Array.from(document.querySelectorAll(
+      '[role="dialog"], [aria-modal="true"], body > div, body > div > div'
+    )).filter(visible).filter(el => {
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      const positionLikeModal = /fixed|absolute|sticky/.test(s.position);
+      const largeEnough = r.width >= 220 && r.height >= 140;
+      const z = Number.parseInt(s.zIndex || '0', 10);
+      return largeEnough && positionLikeModal && (z >= 10 || el.matches('[role="dialog"],[aria-modal="true"]'));
+    });
+
+    let best = null;
+
+    for (const overlay of overlays) {
+      const or = overlay.getBoundingClientRect();
+      const buttons = Array.from(overlay.querySelectorAll(
+        'button,[role="button"],a'
+      )).filter(visible);
+
+      for (const el of buttons) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 90 || r.height > 90) continue;
+
+        const aria = el.getAttribute('aria-label') || '';
+        const title = el.getAttribute('title') || '';
+        const text = (el.innerText || '').trim();
+        const label = `${aria} ${title} ${text}`.trim();
+        const explicitClose = /close|dismiss|cancel|بستن|لغو/i.test(label);
+        const xGlyph = /^[×✕✖✗x]$/i.test(text);
+        const nearTop = Math.abs(r.top - or.top) <= 85;
+        const nearRight = Math.abs((r.left + r.width) - or.right) <= 85;
+
+        let score = 0;
+        score += explicitClose ? 1000 : 0;
+        score += xGlyph ? 950 : 0;
+        score += nearTop ? 180 : 0;
+        score += nearRight ? 220 : 0;
+        score += el.querySelectorAll('svg').length ? 50 : 0;
+        score += Math.max(0, 90 - r.width) + Math.max(0, 90 - r.height);
+
+        if (!best || score > best.score) {
+          const token = `ig-overlay-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          el.setAttribute('data-ig-overlay-close', token);
+          best = { token, score };
+        }
+      }
+    }
+
+    return best;
+  }).catch(() => null);
+
+  if (closeInfo?.token) {
+    const selector = `[data-ig-overlay-close="${String(closeInfo.token).replace(/"/g, '\\"')}"]`;
+    const closeButton = page.locator(selector).first();
+    if (await closeButton.isVisible().catch(() => false)) {
+      closed = await safeClick(closeButton, 1200);
+      if (closed) {
+        await page.waitForTimeout(250).catch(() => {});
+      }
+    }
+  }
+
+  return closed;
 }
 
 async function login(page, context) {
@@ -376,34 +473,67 @@ async function findCommentButton(page) {
 }
 
 async function clickRealCommentButton(page) {
-  const ranked = await rankCommentButtonCandidates(page);
-  if (!ranked.length) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  // A blocking sheet can already be open when the post is reached. Close it
+  // before ranking the action rail so its buttons cannot intercept the click.
+  await dismissTransientOverlay(page);
 
   let sawAnyCandidate = false;
 
-  for (const candidate of ranked.slice(0, 8)) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const ranked = await rankCommentButtonCandidates(page);
+    if (!ranked.length) break;
+
+    const candidate = ranked[Math.min(attempt, ranked.length - 1)];
     sawAnyCandidate = true;
+
     appendLog('COMMENT_BUTTON_ATTEMPT', {
       strategy: candidate.strategy,
       score: candidate.score,
       label: candidate.label,
-      rect: candidate.rect
+      rect: candidate.rect,
+      attempt: attempt + 1
     });
 
     const locator = page.locator('button,[role="button"],a').nth(candidate.index);
     if (!(await locator.isVisible().catch(() => false))) {
-      appendLog('COMMENT_BUTTON_SKIP_INVISIBLE', { strategy: candidate.strategy, score: candidate.score });
+      appendLog('COMMENT_BUTTON_SKIP_INVISIBLE', {
+        strategy: candidate.strategy,
+        score: candidate.score,
+        attempt: attempt + 1
+      });
       continue;
     }
 
     await locator.scrollIntoViewIfNeeded().catch(() => {});
-    await locator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async error => {
+
+    let clicked = false;
+    try {
+      await locator.click({ timeout: CLICK_TIMEOUT_MS });
+      clicked = true;
+    } catch (error) {
       appendLog('COMMENT_BUTTON_CLICK_FAILED', {
         strategy: candidate.strategy,
         score: candidate.score,
+        attempt: attempt + 1,
         error: String(error?.message || error)
       });
-    });
+    }
+
+    // CRITICAL: never treat an existing/incorrect DOM subtree as proof that
+    // the click worked. The previous version did exactly that after a
+    // pointer-interception timeout and then selected a profile/overlay as the
+    // "comment root".
+    if (!clicked) {
+      const closed = await dismissTransientOverlay(page);
+      appendLog('COMMENT_BUTTON_BLOCKING_OVERLAY_HANDLED', {
+        strategy: candidate.strategy,
+        score: candidate.score,
+        closed,
+        attempt: attempt + 1
+      });
+      await page.waitForTimeout(300);
+      continue;
+    }
 
     const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 6000));
     if (verified) {
@@ -417,7 +547,8 @@ async function clickRealCommentButton(page) {
 
     appendLog('COMMENT_BUTTON_VERIFY_FAILED', {
       strategy: candidate.strategy,
-      score: candidate.score
+      score: candidate.score,
+      attempt: attempt + 1
     });
 
     await dismissTransientOverlay(page);
@@ -487,6 +618,8 @@ async function getCommentRootDescriptor(page) {
       }
 
       const scrollable = /auto|scroll/i.test(s.overflowY) && el.scrollHeight > el.clientHeight + 80;
+      const desktopPanelLike = innerWidth < 900 || (r.left >= innerWidth * 0.42 && r.width <= innerWidth * 0.72);
+      const dialogLike = el.matches('[role=\"dialog\"],[aria-modal=\"true\"]');
       const textLen = text.length;
       let score = 0;
       score += scrollable ? 30 : -10;
@@ -495,6 +628,8 @@ async function getCommentRootDescriptor(page) {
       score += Math.min(30, replyCount * 5);
       score += Math.min(80, rowCount * 18);
       score += Math.min(15, moreCount * 8);
+      score += desktopPanelLike ? 24 : -45;
+      score -= dialogLike ? 55 : 0;
       score -= Math.min(20, addCommentCount * 5);
       score -= Math.min(25, messageCount * 6);
       score -= Math.min(15, sendCount * 2);
@@ -504,7 +639,11 @@ async function getCommentRootDescriptor(page) {
       if (rowCount < 1) score -= 40;
       if (!timeCount && !replyCount) score -= 16;
 
-      if (score < 0) return null;
+      // On desktop the actual comments pane is a right-side panel. A small
+      // left-side profile/upsell sheet must never qualify as the root.
+      if (!desktopPanelLike) return null;
+      if (dialogLike && rowCount < 2 && timeCount < 1 && replyCount < 1) return null;
+      if (score < 50) return null;
       return {
         score,
         profileCount,
@@ -904,9 +1043,20 @@ async function scanCommentList(page, root, postLog) {
   return Array.from(map.values());
 }
 
-async function saveCommentsScreenshot(root, postLog) {
+async function saveCommentsScreenshot(page, root, postLog) {
   const screenshotPath = path.join(ARTIFACTS, 'comments-list.png');
-  await root.screenshot({ path: screenshotPath });
+  try {
+    await root.screenshot({ path: screenshotPath });
+  } catch (rootScreenshotError) {
+    // Keep the artifact contract even if the React/Instagram root is re-rendered
+    // between verification and capture. A full-page capture is still preferable
+    // to losing the diagnostic screenshot completely.
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+    appendLog('COMMENTS_ROOT_SCREENSHOT_FALLBACK', {
+      url: postLog.url,
+      error: String(rootScreenshotError?.message || rootScreenshotError)
+    });
+  }
   postLog.screenshot = screenshotPath;
   appendLog('COMMENTS_SCREENSHOT_SAVED', { url: postLog.url, screenshot: screenshotPath });
 }
@@ -1991,10 +2141,38 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   await sendButton.scrollIntoViewIfNeeded().catch(() => {});
 
-  // Submit exactly once through the normal human action: one Enter.
-  // If Instagram does not clear the composer, use the already located
-  // Send/Post control as the fallback.
-  await input.press('Enter').catch(() => {});
+  // The requested final public-comment flow is explicit: after the full
+  // payload is in the main comment input, click the Post control. Do not use
+  // Enter as the primary submit action because Instagram can interpret it
+  // differently depending on the current composer state.
+  let postClicked = false;
+  try {
+    await sendButton.click({ timeout: CLICK_TIMEOUT_MS });
+    postClicked = true;
+  } catch (error) {
+    appendLog('MAIN_COMMENT_SEND_CLICK_FAILED', {
+      username: user,
+      error: String(error?.message || error)
+    });
+    const closed = await dismissTransientOverlay(page);
+    if (closed) {
+      await page.waitForTimeout(250);
+      try {
+        await sendButton.click({ timeout: CLICK_TIMEOUT_MS });
+        postClicked = true;
+      } catch (retryError) {
+        appendLog('MAIN_COMMENT_SEND_RETRY_FAILED', {
+          username: user,
+          error: String(retryError?.message || retryError)
+        });
+      }
+    }
+  }
+
+  if (!postClicked) {
+    throw new Error('MAIN_COMMENT_SEND_CLICK_FAILED');
+  }
+
   await page.waitForTimeout(500);
 
   let composerCleared = await page.waitForFunction(
@@ -2013,7 +2191,7 @@ async function sendMainCommentReply(page, root, username, replyText) {
   ).then(() => true).catch(() => false);
 
   if (!composerCleared) {
-    await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+    await sendButton.click({ timeout: CLICK_TIMEOUT_MS });
     await page.waitForTimeout(500);
     composerCleared = await page.waitForFunction(
       composerToken => {
@@ -2033,7 +2211,8 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
     username: user,
-    method: composerCleared ? 'enter' : 'main-composer-send-button',
+    method: 'post-button',
+    composerCleared,
     payload
   });
 
@@ -2688,6 +2867,7 @@ async function ensureCommentsUi(page, postUrl) {
   await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1200);
   await dismissCommonPopups(page);
+  await dismissTransientOverlay(page);
 
   await page.evaluate(() => {
     document.querySelectorAll('[data-ig-comment-root="1"]').forEach(el => {
@@ -2772,7 +2952,7 @@ async function processPost(page, dmPage, url, keywords, commentReply, dmReply, p
     await markCommentRoot(page, descriptor);
     const root = await getRootLocator(page);
 
-    await saveCommentsScreenshot(root, postLog);
+    await saveCommentsScreenshot(page, root, postLog);
 
     const comments = await scanCommentList(page, root, postLog);
     if (!comments.length) {

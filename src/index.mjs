@@ -309,6 +309,21 @@ function interruptionRecoveryPattern() {
 async function recoverBlockedTarget(page, reason = 'target-not-found') {
   if (!page || page.isClosed()) return false;
 
+  // Never blindly click a generic "Continue" over and over. If the page is the
+  // Instagram account chooser, handle that state explicitly and only once.
+  const isChooser = await page.evaluate(() => {
+    const text = String(document.body?.innerText || '')
+      .normalize('NFKC')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    return text.includes('use another profile') && text.includes('continue');
+  }).catch(() => false);
+
+  if (isChooser && typeof detectAndContinueAccountChooser === 'function') {
+    return detectAndContinueAccountChooser(page, reason).catch(() => false);
+  }
+
   const token = `ig-recovery-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const pattern = interruptionRecoveryPattern();
 
@@ -337,12 +352,6 @@ async function recoverBlockedTarget(page, reason = 'target-not-found') {
       );
     };
 
-    const isControl = el => {
-      if (!el) return false;
-      const tag = el.tagName;
-      return tag === 'BUTTON' || tag === 'A' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'menuitem';
-    };
-
     const controls = Array.from(document.querySelectorAll('button,a,[role="button"],[role="menuitem"]'))
       .filter(visible)
       .map(el => ({
@@ -350,75 +359,43 @@ async function recoverBlockedTarget(page, reason = 'target-not-found') {
         text: normalize(el.innerText || el.textContent || ''),
         aria: normalize(el.getAttribute('aria-label') || ''),
         title: normalize(el.getAttribute('title') || '')
-      }))
-      .filter(x => isControl(x.el));
+      }));
 
-    const exact = [];
     const strong = new Set([
-      'continue',
-      'continue anyway',
-      'allow and continue',
-      'maybe later',
-      'not now',
-      'skip',
-      'done',
-      'got it',
-      'ادامه',
-      'ادامه دهید',
-      'ادامه دادن',
-      'ادامه بده',
-      'فعلاً نه',
-      'بعداً',
-      'بعدا',
-      'اکنون نه',
-      'نه الان',
-      'رد کردن',
-      'بی‌خیال',
-      'متوجه شدم'
+      'continue', 'continue anyway', 'allow and continue', 'maybe later', 'not now', 'skip', 'done', 'got it',
+      'ادامه', 'ادامه دهید', 'ادامه دادن', 'ادامه بده', 'فعلاً نه', 'بعداً', 'بعدا', 'اکنون نه', 'نه الان', 'رد کردن', 'بی‌خیال', 'متوجه شدم'
     ]);
 
-    for (const item of controls) {
-      const label = [item.text, item.aria, item.title].find(Boolean) || '';
-      if (!label || !strong.has(label)) continue;
-      const r = item.el.getBoundingClientRect();
-      exact.push({
-        el: item.el,
-        label,
-        area: r.width * r.height,
-        top: r.top,
-        left: r.left
-      });
-    }
-
-    exact.sort((a, b) => {
-      const priority = value => {
-        if (value === 'continue' || value === 'ادامه' || value === 'ادامه دهید' || value === 'ادامه بده') return 0;
-        if (value === 'continue anyway' || value === 'allow and continue') return 1;
-        if (value === 'not now' || value === 'اکنون نه' || value === 'نه الان') return 2;
-        if (value === 'maybe later' || value === 'بعداً' || value === 'بعدا') return 3;
-        if (value === 'skip' || value === 'رد کردن') return 4;
-        return 5;
-      };
-      return priority(a.label) - priority(b.label) || a.area - b.area || a.top - b.top;
-    });
+    const exact = controls
+      .map(item => ({ ...item, label: [item.text, item.aria, item.title].find(Boolean) || '' }))
+      .filter(item => strong.has(item.label))
+      .map(item => {
+        const r = item.el.getBoundingClientRect();
+        return { el: item.el, label: item.label, area: r.width * r.height, top: r.top, left: r.left };
+      })
+      .sort((a, b) => a.label.localeCompare(b.label) || a.area - b.area || a.top - b.top);
 
     if (!exact.length) return null;
 
-    const best = exact[0];
-    best.el.setAttribute('data-ig-interrupt-recovery', token);
-    return { token, label: best.label };
+    // Do not use the generic recovery path for a control in the page header
+    // unless it is actually inside a visible dialog-like interruption.
+    const preferred = exact.find(item => {
+      const r = item.el.getBoundingClientRect();
+      const nearCenter = r.left > innerWidth * 0.18 && r.left < innerWidth * 0.82;
+      return nearCenter || item.label === 'continue' || item.label === 'ادامه';
+    }) || exact[0];
+
+    preferred.el.setAttribute('data-ig-interrupt-recovery', token);
+    return { token, label: preferred.label };
   }, { token }).catch(() => null);
 
   if (!descriptor?.token) return false;
 
-  const safeToken = String(descriptor.token).replace(/"/g, '\\\"');
+  const safeToken = String(descriptor.token).replace(/"/g, '\\"');
   const recovery = page.locator(`[data-ig-interrupt-recovery="${safeToken}"]`).first();
   if (!(await recovery.isVisible().catch(() => false))) return false;
 
-  appendLog('INTERRUPTION_RECOVERY_FOUND', {
-    reason,
-    action: descriptor.label
-  });
+  appendLog('INTERRUPTION_RECOVERY_FOUND', { reason, action: descriptor.label });
 
   let clicked = false;
   try {
@@ -437,10 +414,7 @@ async function recoverBlockedTarget(page, reason = 'target-not-found') {
   await recovery.evaluate(el => el.removeAttribute('data-ig-interrupt-recovery')).catch(() => {});
 
   if (clicked) {
-    appendLog('INTERRUPTION_RECOVERY_CLICKED', {
-      reason,
-      action: descriptor.label
-    });
+    appendLog('INTERRUPTION_RECOVERY_CLICKED', { reason, action: descriptor.label });
     await page.waitForTimeout(INTERRUPT_RECOVERY_WAIT_MS).catch(() => {});
   }
 
@@ -449,17 +423,30 @@ async function recoverBlockedTarget(page, reason = 'target-not-found') {
 
 async function safeClick(locator, timeout = 3000, options = {}) {
   const page = options?.page || locator?.page?.() || null;
-  const recoveryAttempts = Math.max(0, Math.min(INTERRUPT_RECOVERY_ATTEMPTS, Number(options?.recoveryAttempts ?? INTERRUPT_RECOVERY_ATTEMPTS)));
+  const recoveryAttempts = Math.max(0, Math.min(2, Number(options?.recoveryAttempts ?? 1)));
   const reason = options?.reason || 'target-click-failed';
 
+  let previousSignature = null;
   for (let attempt = 0; attempt <= recoveryAttempts; attempt += 1) {
     try {
       await locator.first().click({ timeout });
       return true;
     } catch {
       if (!page || attempt >= recoveryAttempts) return false;
+
+      previousSignature = await page.evaluate(() => `${location.href}|${String(document.body?.innerText || '').slice(0, 2200)}`)
+        .catch(() => page.url());
+
       const recovered = await recoverBlockedTarget(page, reason);
       if (!recovered) return false;
+
+      await page.waitForTimeout(250).catch(() => {});
+      const currentSignature = await page.evaluate(() => `${location.href}|${String(document.body?.innerText || '').slice(0, 2200)}`)
+        .catch(() => page.url());
+
+      // If the same interruption is still in exactly the same state, retrying
+      // only burns the workflow time budget and creates infinite Continue loops.
+      if (currentSignature === previousSignature) return false;
     }
   }
 
@@ -476,9 +463,78 @@ async function dismissCommonPopups(page) {
   }
 }
 
+async function closeObstructingModal(page) {
+  if (!page || page.isClosed()) return false;
+
+  const token = `ig-overlay-close-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const descriptor = await page.evaluate(({ token }) => {
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
+        r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 &&
+        r.left < innerWidth && r.top < innerHeight;
+    };
+
+    const buttons = Array.from(document.querySelectorAll('button,[role="button"],a'))
+      .filter(visible)
+      .map(el => {
+        const r = el.getBoundingClientRect();
+        const text = String(el.innerText || el.textContent || '').trim();
+        const aria = String(el.getAttribute('aria-label') || '').trim();
+        return { el, r, text, aria };
+      })
+      .filter(item => {
+        const small = item.r.width <= 70 && item.r.height <= 70;
+        const xLabel = /^(×|✕|✖|x)$/i.test(item.text) || /close|dismiss|بستن|لغو|بازگشت/i.test(item.aria);
+        if (small && xLabel) return true;
+
+        if (!small) return false;
+        let parent = item.el.parentElement;
+        for (let depth = 0; depth < 6 && parent; depth += 1, parent = parent.parentElement) {
+          const pr = parent.getBoundingClientRect();
+          const ps = getComputedStyle(parent);
+          const positioned = ['fixed','absolute','sticky'].includes(ps.position) || parent.getAttribute('role') === 'dialog';
+          if (!positioned || pr.width < 220 || pr.height < 180) continue;
+          const nearTop = item.r.top <= pr.top + 90;
+          const nearLeft = item.r.left <= pr.left + 90;
+          const nearRight = item.r.right >= pr.right - 90;
+          if (nearTop && (nearLeft || nearRight)) return true;
+        }
+        return false;
+      })
+      .sort((a,b) => (a.r.width*a.r.height) - (b.r.width*b.r.height));
+
+    if (!buttons.length) return null;
+    const best = buttons[0];
+    best.el.setAttribute('data-ig-overlay-close', token);
+    return { token, text: best.text, aria: best.aria };
+  }, { token }).catch(() => null);
+
+  if (!descriptor?.token) return false;
+  const selector = `[data-ig-overlay-close="${String(descriptor.token).replace(/"/g, '\\"')}"]`;
+  const button = page.locator(selector).first();
+  if (!(await button.isVisible().catch(() => false))) return false;
+
+  const clicked = await button.click({ timeout: 1800 }).then(() => true).catch(async () =>
+    button.evaluate(el => { if (el instanceof HTMLElement) { el.click(); return true; } return false; }).catch(() => false)
+  );
+  await button.evaluate(el => el.removeAttribute('data-ig-overlay-close')).catch(() => {});
+
+  if (clicked) {
+    appendLog('OBSTRUCTING_MODAL_CLOSED', { text: descriptor.text, aria: descriptor.aria });
+    await page.waitForTimeout(300).catch(() => {});
+  }
+  return clicked;
+}
+
 async function dismissTransientOverlay(page) {
   if (!page || page.isClosed()) return;
 
+  // First remove anonymous X-style obstruction modals such as the one shown
+  // in comments-list.png. Pressing Escape alone does not reliably close those.
+  await closeObstructingModal(page);
   await page.keyboard.press('Escape').catch(() => {});
   await page.waitForTimeout(250).catch(() => {});
 
@@ -489,7 +545,9 @@ async function dismissTransientOverlay(page) {
 
   for (const candidate of closeCandidates) {
     if (await candidate.isVisible().catch(() => false)) {
-      await safeClick(candidate, 700);
+      await candidate.click({ timeout: 900 }).catch(async () => {
+        await candidate.evaluate(el => { if (el instanceof HTMLElement) el.click(); }).catch(() => {});
+      });
       await page.waitForTimeout(200).catch(() => {});
     }
   }
@@ -583,14 +641,13 @@ async function recoverInstagramInterruption(page, reason = 'navigation', expecte
   if (!page || page.isClosed()) return false;
 
   let acted = false;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const continued = await detectAndContinueAccountChooser(page, reason).catch(error => {
-      appendLog('ACCOUNT_CHOOSER_RECOVERY_ERROR', { reason, error: String(error?.message || error) });
-      throw error;
-    });
-    if (continued) acted = true;
-    else break;
-    await page.waitForTimeout(600).catch(() => {});
+  const continued = await detectAndContinueAccountChooser(page, reason).catch(error => {
+    appendLog('ACCOUNT_CHOOSER_RECOVERY_ERROR', { reason, error: String(error?.message || error) });
+    throw error;
+  });
+  if (continued) {
+    acted = true;
+    await page.waitForTimeout(700).catch(() => {});
   }
 
   await dismissCommonPopups(page);
@@ -638,6 +695,11 @@ async function login(page, context) {
   if (/use another profile/.test(body) && /continue/.test(body)) {
     const continued = await detectAndContinueAccountChooser(page, 'login-final-check');
     if (!continued) throw new Error('ACCOUNT_CHOOSER_CONTINUE_NOT_COMPLETED');
+    const chooserGone = await page.waitForFunction(() => {
+      const t = String(document.body?.innerText || '').toLowerCase().replace(/\s+/g, ' ');
+      return !(t.includes('use another profile') && t.includes('continue'));
+    }, { timeout: 7000 }).then(() => true).catch(() => false);
+    if (!chooserGone) throw new Error('ACCOUNT_CHOOSER_STILL_VISIBLE_AFTER_CONTINUE');
   }
 
   await context.storageState({ path: path.join(ARTIFACTS, 'session-after-run.json') });
@@ -785,6 +847,8 @@ async function findCommentButton(page) {
 
 async function clickRealCommentButton(page) {
   await recoverInstagramInterruption(page, 'comment-button-preflight');
+  await dismissTransientOverlay(page);
+  await page.waitForTimeout(250).catch(() => {});
 
   const directCandidates = [
     page.getByRole('button', { name: /^(Comment|Comments|نظر|نظرات|دیدگاه|دیدگاه‌ها)$/i }).first(),
@@ -822,7 +886,8 @@ async function clickRealCommentButton(page) {
 
   let sawAnyCandidate = false;
 
-  for (const candidate of ranked.slice(0, 8)) {
+  const usableCandidates = ranked.filter(candidate => candidate.score >= 48).slice(0, 6);
+  for (const candidate of usableCandidates) {
     sawAnyCandidate = true;
     appendLog('COMMENT_BUTTON_ATTEMPT', {
       strategy: candidate.strategy,
@@ -838,15 +903,24 @@ async function clickRealCommentButton(page) {
     }
 
     await locator.scrollIntoViewIfNeeded().catch(() => {});
-    await locator.click({ timeout: CLICK_TIMEOUT_MS }).catch(async error => {
+    let firstClickSucceeded = false;
+    try {
+      await locator.click({ timeout: CLICK_TIMEOUT_MS });
+      firstClickSucceeded = true;
+    } catch (error) {
       appendLog('COMMENT_BUTTON_CLICK_FAILED', {
         strategy: candidate.strategy,
         score: candidate.score,
         error: String(error?.message || error)
       });
-    });
+    }
 
-    await recoverInstagramInterruption(page, 'comment-button-after-click');
+    if (!firstClickSucceeded) {
+      // The known failure mode is an unrelated modal intercepting the icon.
+      // Close that obstruction and retry the same high-confidence target once.
+      await dismissTransientOverlay(page);
+      await locator.click({ timeout: 2200 }).catch(() => {});
+    }
     const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 6000));
     if (verified) {
       appendLog('COMMENT_UI_VERIFIED', {
@@ -2770,7 +2844,8 @@ async function getProfilePrivacyState(page) {
 
 
 async function clickProfileMessageAction(dmPage, isPrivate) {
-  await recoverBlockedTarget(dmPage, 'profile-message-preflight');
+  await recoverInstagramInterruption(dmPage, 'profile-message-preflight');
+  await dismissTransientOverlay(dmPage);
   const messageRegex = /^(Message|Send message|پیام|ارسال پیام|ارسال پیام مستقیم)$/i;
   const moreRegex = /^(More options|Options|More|گزینه‌های بیشتر|گزینه ها|بیشتر)$/i;
 
@@ -2861,7 +2936,7 @@ async function activateDmCategoryIfPresent(dmPage, username) {
 
 async function findDmComposer(dmPage, username) {
   await recoverInstagramInterruption(dmPage, 'dm-composer-preflight');
-  await recoverBlockedTarget(dmPage, 'dm-composer-preflight');
+  await dismissTransientOverlay(dmPage);
   await activateDmCategoryIfPresent(dmPage, username);
   const candidates = await dmPage.evaluate(() => {
     const normalize = value => String(value || '')
@@ -3169,7 +3244,7 @@ async function sendDM(dmPage, profilePath, username, message) {
   }
 
   if (!composerResult?.input) {
-    const recovered = await recoverBlockedTarget(dmPage, 'dm-composer-not-found');
+    const recovered = await recoverInstagramInterruption(dmPage, 'dm-composer-not-found');
     if (recovered) {
       await dmPage.waitForTimeout(INTERRUPT_RECOVERY_WAIT_MS);
       composerResult = await findDmComposer(dmPage, username).catch(error => {

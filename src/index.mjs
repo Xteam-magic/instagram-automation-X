@@ -316,8 +316,8 @@ async function recoverBlockedTarget(page, reason = 'target-not-found') {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
-      .replace(/[\\u200b\\u200c\\u200d\\ufeff]/g, '')
-      .replace(/\\s+/g, ' ')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
 
     const visible = el => {
@@ -495,10 +495,128 @@ async function dismissTransientOverlay(page) {
   }
 }
 
+
+async function detectAndContinueAccountChooser(page, reason = 'interstitial') {
+  if (!page || page.isClosed()) return false;
+
+  const descriptor = await page.evaluate(() => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
+        r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 &&
+        r.left < innerWidth && r.top < innerHeight;
+    };
+
+    const body = normalize(document.body?.innerText || '');
+    const hasChooserSignature =
+      /use another profile/.test(body) &&
+      /continue/.test(body);
+
+    if (!hasChooserSignature) return null;
+
+    const controls = Array.from(document.querySelectorAll(
+      'button,a,[role="button"],[role="menuitem"],input[type="button"],input[type="submit"]'
+    )).filter(visible);
+
+    const candidates = controls.map(el => ({
+      el,
+      text: normalize(el.innerText || el.textContent || el.value || ''),
+      aria: normalize(el.getAttribute('aria-label') || ''),
+      title: normalize(el.getAttribute('title') || '')
+    })).filter(x => x.text === 'continue' || x.aria === 'continue' || x.title === 'continue');
+
+    if (!candidates.length) return { detected: true, token: null, label: 'continue' };
+
+    const best = candidates[0];
+    const token = `ig-account-continue-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    best.el.setAttribute('data-ig-account-continue', token);
+    return { detected: true, token, label: best.text || best.aria || best.title || 'continue' };
+  }).catch(() => null);
+
+  if (!descriptor?.detected) return false;
+
+  appendLog('ACCOUNT_CHOOSER_DETECTED', { reason });
+
+  if (!descriptor.token) {
+    throw new Error('ACCOUNT_CHOOSER_CONTINUE_NOT_FOUND');
+  }
+
+  const selector = `[data-ig-account-continue="${String(descriptor.token).replace(/"/g, '\\"')}"]`;
+  const button = page.locator(selector).first();
+  let clicked = false;
+
+  if (await button.isVisible().catch(() => false)) {
+    try {
+      await button.click({ timeout: 3500 });
+      clicked = true;
+    } catch {
+      clicked = await button.evaluate(el => {
+        if (el instanceof HTMLElement) {
+          el.click();
+          return true;
+        }
+        return false;
+      }).catch(() => false);
+    }
+  }
+
+  await page.locator(selector).first().evaluate(el => el.removeAttribute('data-ig-account-continue')).catch(() => {});
+
+  if (!clicked) throw new Error('ACCOUNT_CHOOSER_CONTINUE_CLICK_FAILED');
+
+  appendLog('ACCOUNT_CHOOSER_CONTINUE_CLICKED', { reason });
+  await page.waitForTimeout(1200).catch(() => {});
+  await dismissCommonPopups(page);
+  return true;
+}
+
+async function recoverInstagramInterruption(page, reason = 'navigation', expectedUrl = null) {
+  if (!page || page.isClosed()) return false;
+
+  let acted = false;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const continued = await detectAndContinueAccountChooser(page, reason).catch(error => {
+      appendLog('ACCOUNT_CHOOSER_RECOVERY_ERROR', { reason, error: String(error?.message || error) });
+      throw error;
+    });
+    if (continued) acted = true;
+    else break;
+    await page.waitForTimeout(600).catch(() => {});
+  }
+
+  await dismissCommonPopups(page);
+
+  const url = page.url();
+  if (/\/accounts\/login|\/challenge|\/two_factor/i.test(url)) {
+    if (!env.INSTAGRAM_USERNAME || !env.INSTAGRAM_PASSWORD) {
+      throw new Error('INSTAGRAM_AUTH_REQUIRED_AFTER_CONTINUE');
+    }
+  }
+
+  if (acted && expectedUrl && !page.url().includes(new URL(expectedUrl).pathname)) {
+    appendLog('REOPEN_EXPECTED_URL_AFTER_ACCOUNT_CONTINUE', { reason, expectedUrl, currentUrl: page.url() });
+    await page.goto(expectedUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(900);
+    await detectAndContinueAccountChooser(page, `${reason}-reopen`);
+    await dismissCommonPopups(page);
+  }
+
+  return acted;
+}
+
 async function login(page, context) {
   await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForTimeout(1200);
-  await dismissCommonPopups(page);
+  await recoverInstagramInterruption(page, 'initial-login');
 
   if (page.url().includes('/accounts/login')) {
     if (!env.INSTAGRAM_USERNAME || !env.INSTAGRAM_PASSWORD) {
@@ -509,14 +627,22 @@ async function login(page, context) {
     await page.getByLabel(/Password/i).fill(env.INSTAGRAM_PASSWORD);
     await page.getByRole('button', { name: /Log in|ورود/i }).click({ timeout: 8000 });
     await page.waitForTimeout(4000);
+    await recoverInstagramInterruption(page, 'post-credential-login');
 
     if (/challenge|two_factor|login/.test(page.url())) {
       throw new Error('Instagram requires interactive login/2FA.');
     }
   }
 
+  const body = normalizeText(await page.locator('body').innerText().catch(() => ''));
+  if (/use another profile/.test(body) && /continue/.test(body)) {
+    const continued = await detectAndContinueAccountChooser(page, 'login-final-check');
+    if (!continued) throw new Error('ACCOUNT_CHOOSER_CONTINUE_NOT_COMPLETED');
+  }
+
   await context.storageState({ path: path.join(ARTIFACTS, 'session-after-run.json') });
 }
+
 
 function validProfileHref(href) {
   const v = String(href || '');
@@ -658,6 +784,35 @@ async function findCommentButton(page) {
 }
 
 async function clickRealCommentButton(page) {
+  await recoverInstagramInterruption(page, 'comment-button-preflight');
+
+  const directCandidates = [
+    page.getByRole('button', { name: /^(Comment|Comments|نظر|نظرات|دیدگاه|دیدگاه‌ها)$/i }).first(),
+    page.locator('button[aria-label="Comment" i],button[aria-label*="Comment" i],button[title="Comment" i],button[title*="Comment" i]').first(),
+    page.locator('[role="button"][aria-label="Comment" i],[role="button"][aria-label*="Comment" i]').first()
+  ];
+
+  for (const direct of directCandidates) {
+    if (!(await direct.isVisible().catch(() => false))) continue;
+    await direct.scrollIntoViewIfNeeded().catch(() => {});
+    let clicked = false;
+    try {
+      await direct.click({ timeout: CLICK_TIMEOUT_MS });
+      clicked = true;
+    } catch {
+      clicked = await direct.evaluate(el => { if (el instanceof HTMLElement) { el.click(); return true; } return false; }).catch(() => false);
+    }
+    if (clicked) {
+      const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 7000));
+      if (verified) {
+        appendLog('COMMENT_BUTTON_DIRECT_SUCCESS', { label: await direct.getAttribute('aria-label').catch(() => null) });
+        return { strategy: 'direct-aria-label', score: 999, label: await direct.getAttribute('aria-label').catch(() => null) || '' };
+      }
+      await dismissTransientOverlay(page);
+      await page.waitForTimeout(300);
+    }
+  }
+
   const ranked = await rankCommentButtonCandidates(page);
   if (!ranked.length) {
     const recovered = await recoverBlockedTarget(page, 'comment-button-not-found');
@@ -691,6 +846,7 @@ async function clickRealCommentButton(page) {
       });
     });
 
+    await recoverInstagramInterruption(page, 'comment-button-after-click');
     const verified = await waitForCommentRoot(page, Math.min(ROOT_TIMEOUT_MS, 6000));
     if (verified) {
       appendLog('COMMENT_UI_VERIFIED', {
@@ -740,35 +896,66 @@ async function getCommentRootDescriptor(page) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    const scoreRoot = el => {
+    const visible = el => {
+      if (!el) return false;
       const r = el.getBoundingClientRect();
       const s = getComputedStyle(el);
-      if (r.width < 220 || r.height < 140) return null;
-      if (r.right <= 0 || r.bottom <= 0 || r.left >= innerWidth || r.top >= innerHeight) return null;
+      return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' &&
+        r.width > 0 && r.height > 0 && r.right > 0 && r.bottom > 0 &&
+        r.left < innerWidth && r.top < innerHeight;
+    };
 
-      const text = (el.innerText || '').trim();
+    const exactTextSignal = (el, pattern) => {
+      const t = normalize(el.textContent || el.innerText || '');
+      return pattern.test(t);
+    };
+
+    const scoreRoot = el => {
+      if (!visible(el)) return null;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      if (r.width < 360 || r.height < 260) return null;
+
+      // Reject page-sized overlays/background containers. The supplied failure
+      // screenshot showed a generic modal being mistaken for the comments root.
+      const nearlyFullScreen = r.width >= innerWidth * 0.93 && r.height >= innerHeight * 0.90;
+      if (nearlyFullScreen) return null;
+
+      const text = String(el.innerText || '').trim();
+      if (!text || text.length > 12000) return null;
+
       const profileLinks = Array.from(el.querySelectorAll('a[href^="/"]'))
         .filter(a => validProfileHref(a.getAttribute('href')));
       const profileCount = profileLinks.length;
       const timeCount = el.querySelectorAll('time').length;
       const replyCount = (text.match(/\bReply\b/gi) || []).length + (text.match(/پاسخ/g) || []).length;
-      const addCommentCount = (text.match(/Add a comment/gi) || []).length + (text.match(/نظر خود را بنویسید|افزودن نظر/gi) || []).length;
-      const moreCount = (text.match(/View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات/gi) || []).length;
-      const messageCount = (text.match(/Message|Send message|پیام|ارسال پیام/gi) || []).length;
-      const sendCount = (text.match(/\bSend\b|ارسال/gi) || []).length;
+      const addCommentCount =
+        (text.match(/Add a comment/gi) || []).length +
+        (text.match(/نظر خود را بنویسید|افزودن نظر|نظر خود را اضافه کنید/g) || []).length;
+      const moreCount =
+        (text.match(/View more comments|Load more comments|View all \d+ comments|View all comments|نمایش نظرهای بیشتر|نمایش دیدگاه‌های بیشتر|مشاهده همه نظرات/g) || []).length;
+      const headerCount = Array.from(el.querySelectorAll('h1,h2,h3,[role="heading"]'))
+        .filter(visible)
+        .filter(node => /^(comments|comment|نظرات|دیدگاه‌ها|دیدگاه ها|نظرات و دیدگاه‌ها)$/i.test(normalize(node.textContent || '')))
+        .length;
+      const exactCommentButtonCount = Array.from(el.querySelectorAll('button,a,[role="button"]'))
+        .filter(visible)
+        .filter(node => /^(reply|پاسخ|view all comments|comments|نظرات)$/i.test(normalize(node.innerText || node.getAttribute('aria-label') || '')))
+        .length;
 
       let rowCount = 0;
       const seen = new Set();
       for (const link of profileLinks) {
         let node = link;
-        for (let level = 0; level < 10 && node && node !== el; level++) {
+        for (let level = 0; level < 12 && node && node !== el; level++) {
           node = node.parentElement;
-          if (!node) break;
+          if (!node || !visible(node)) continue;
           const t = normalize(node.innerText || '');
           if (!t || t.length > 900) continue;
           if (!t.includes(normalize(link.textContent || ''))) continue;
-          if (!(node.querySelector('time') || /\bReply\b|پاسخ/i.test(t))) continue;
-          const key = `${t.slice(0, 220)}|${normalize(link.textContent || '')}`;
+          if (!node.querySelector('time')) continue;
+          if (!/\bReply\b|پاسخ|Like|لایک|View all|نمایش/i.test(t) && t.length < 20) continue;
+          const key = `${t.slice(0, 260)}|${normalize(link.textContent || '')}`;
           if (seen.has(key)) break;
           seen.add(key);
           rowCount++;
@@ -777,24 +964,33 @@ async function getCommentRootDescriptor(page) {
       }
 
       const scrollable = /auto|scroll/i.test(s.overflowY) && el.scrollHeight > el.clientHeight + 80;
-      const textLen = text.length;
-      let score = 0;
-      score += scrollable ? 30 : -10;
-      score += Math.min(80, profileCount * 9);
-      score += Math.min(35, timeCount * 10);
-      score += Math.min(30, replyCount * 5);
-      score += Math.min(80, rowCount * 18);
-      score += Math.min(15, moreCount * 8);
-      score -= Math.min(20, addCommentCount * 5);
-      score -= Math.min(25, messageCount * 6);
-      score -= Math.min(15, sendCount * 2);
-      if (textLen > 9000) score -= 18;
-      if (textLen < 150) score -= 18;
-      if (profileCount < 1) score -= 30;
-      if (rowCount < 1) score -= 40;
-      if (!timeCount && !replyCount) score -= 16;
+      const positionOk = ['fixed', 'absolute', 'sticky'].includes(s.position) || el.getAttribute('role') === 'dialog';
+      const panelLike = positionOk && r.width >= 360;
 
-      if (score < 0) return null;
+      // A real comments panel must have a direct comments signal. This is the
+      // key guard against the unrelated "from <account>" modal in the supplied
+      // screenshot being accepted as a comments root.
+      const directCommentsSignal =
+        headerCount > 0 ||
+        addCommentCount > 0 ||
+        moreCount > 0 ||
+        (replyCount > 0 && timeCount > 0 && profileCount > 0);
+
+      if (!panelLike || !directCommentsSignal) return null;
+      if (rowCount < 1) return null;
+
+      let score = 0;
+      score += panelLike ? 35 : 0;
+      score += headerCount * 80;
+      score += addCommentCount * 70;
+      score += moreCount * 25;
+      score += Math.min(90, rowCount * 22);
+      score += Math.min(60, profileCount * 10);
+      score += Math.min(45, timeCount * 10);
+      score += Math.min(35, replyCount * 5);
+      score += scrollable ? 35 : 0;
+      score += exactCommentButtonCount * 10;
+
       return {
         score,
         profileCount,
@@ -803,8 +999,10 @@ async function getCommentRootDescriptor(page) {
         replyCount,
         addCommentCount,
         moreCount,
+        headerCount,
         scrollable,
-        textLen,
+        position: s.position,
+        textLen: text.length,
         rect: { left: r.left, top: r.top, width: r.width, height: r.height },
         tag: el.tagName.toLowerCase(),
         textPreview: text.slice(0, 180)
@@ -813,13 +1011,17 @@ async function getCommentRootDescriptor(page) {
 
     const candidates = Array.from(document.querySelectorAll('body *'))
       .map(el => ({ el, info: scoreRoot(el) }))
-      .filter(x => x.info && x.info.score >= 50)
-      .sort((a, b) => b.info.score - a.info.score || b.info.rowCount - a.info.rowCount || b.info.profileCount - a.info.profileCount);
+      .filter(x => x.info && x.info.score >= 60)
+      .sort((a, b) => b.info.score - a.info.score || b.info.rowCount - a.info.rowCount || b.info.headerCount - a.info.headerCount);
 
     if (!candidates.length) return null;
 
     const best = candidates[0];
+    document.querySelectorAll('[data-ig-comment-root="1"]').forEach(el => {
+      if (el !== best.el) el.removeAttribute('data-ig-comment-root');
+    });
     best.el.setAttribute('data-ig-comment-root', '1');
+
     return {
       index: candidates.findIndex(x => x.el === best.el),
       ...best.info
@@ -830,17 +1032,12 @@ async function getCommentRootDescriptor(page) {
 async function waitForCommentRoot(page, timeoutMs = ROOT_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    await recoverInstagramInterruption(page, 'comment-root-preflight').catch(error => { throw error; });
     const root = await getCommentRootDescriptor(page);
     if (
       root &&
       root.rowCount >= 1 &&
-      (
-        root.profileCount >= 2 ||
-        root.timeCount >= 1 ||
-        root.replyCount >= 1 ||
-        root.moreCount >= 1 ||
-        (root.profileCount >= 1 && root.scrollable)
-      )
+      (root.headerCount > 0 || root.addCommentCount > 0 || root.moreCount > 0 || (root.replyCount >= 1 && root.timeCount >= 1))
     ) {
       return root;
     }
@@ -2631,8 +2828,41 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
 }
 
 
+
+async function activateDmCategoryIfPresent(dmPage, username) {
+  const labels = [
+    /^(Primary|Primary inbox)$/i,
+    /^(General|General inbox)$/i,
+    /^(اولیه|اصلی|عمومی)$/i,
+    /^(Requests|Message requests)$/i,
+    /^(درخواست‌ها|درخواست ها)$/i
+  ];
+
+  for (const rx of labels) {
+    const candidates = [
+      dmPage.getByRole('button', { name: rx }).first(),
+      dmPage.getByRole('tab', { name: rx }).first(),
+      dmPage.getByText(rx).last()
+    ];
+    for (const candidate of candidates) {
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      appendLog('DM_CATEGORY_OPTION_FOUND', { username, label: String(rx) });
+      const clicked = await safeClick(candidate, 2500, { page: dmPage, reason: `dm-category-${String(rx)}` });
+      if (clicked) {
+        await dmPage.waitForTimeout(800);
+        appendLog('DM_CATEGORY_SELECTED', { username, label: String(rx) });
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 async function findDmComposer(dmPage, username) {
+  await recoverInstagramInterruption(dmPage, 'dm-composer-preflight');
   await recoverBlockedTarget(dmPage, 'dm-composer-preflight');
+  await activateDmCategoryIfPresent(dmPage, username);
   const candidates = await dmPage.evaluate(() => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
@@ -2910,6 +3140,7 @@ async function sendDM(dmPage, profilePath, username, message) {
 
   await dmPage.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await dmPage.waitForTimeout(1200);
+  await recoverInstagramInterruption(dmPage, 'dm-profile-open', profileUrl);
   await dismissCommonPopups(dmPage);
   await dismissTransientOverlay(dmPage);
 
@@ -2918,6 +3149,8 @@ async function sendDM(dmPage, profilePath, username, message) {
 
   const action = await clickProfileMessageAction(dmPage, isPrivate);
   appendLog('DM_MESSAGE_ACTION_FOUND', { username, action, private: isPrivate });
+  await recoverInstagramInterruption(dmPage, 'after-message-action');
+  await activateDmCategoryIfPresent(dmPage, username);
 
   // Do not assume the composer exists immediately after Message. Instagram
   // hydrates the conversation pane asynchronously.

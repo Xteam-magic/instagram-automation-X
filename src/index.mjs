@@ -169,6 +169,131 @@ function writeJson(name, data) {
   fs.writeFileSync(path.join(ARTIFACTS, name), JSON.stringify(data, null, 2), 'utf8');
 }
 
+const RUN_EMAIL_TO = 'ali94khodaei@gmail.com';
+const RUN_EMAIL_CC = 'emad_1382@yahoo.com';
+const RUN_EMAIL_ENDPOINT = `https://formsubmit.co/ajax/${RUN_EMAIL_TO}`;
+
+function buildRunSummaryEmail(runLog) {
+  const lines = [
+    '🤖 Instagram Automation — خلاصه اجرای کامل',
+    '',
+    `📅 شروع: ${runLog.startedAt || '-'}`,
+    `✅ پایان: ${runLog.finishedAt || '-'}`,
+    '',
+    `🔑 کلمات کلیدی: ${Array.isArray(runLog.keywords) && runLog.keywords.length ? runLog.keywords.join(' | ') : '-'}`,
+    `💬 مجموع کامنت‌های اسکن‌شده: ${Number(runLog.commentsScanned || 0)}`,
+    `🎯 مجموع کامنت‌های مچ‌شده: ${Number(runLog.matchesFound || 0)}`,
+    `📨 دایرکت‌های موفق: ${Number(runLog.successfulDirectMessages || 0)}`,
+    `↩️ ریپلای‌های موفق: ${Number(runLog.successfulReplies || 0)}`,
+    `🏁 مچ‌های تکمیل‌شده: ${Number(runLog.matchesCompleted || 0)}`,
+    `⚠️ مچ‌های ناموفق: ${Number(runLog.matchesFailed || 0)}`,
+    '',
+    '📌 پست‌ها:',
+    ...((runLog.posts || []).flatMap((post, index) => [
+      `${index + 1}. 🔗 ${post.url || '-'}`,
+      `   💬 کامنت‌ها: ${Number(post.commentsScanned || 0)} | 🎯 مچ: ${Number(post.matchesFound || 0)} | 📨 DM: ${Number(post.successfulDirectMessages || 0)} | ↩️ Reply: ${Number(post.successfulReplies || 0)} | ✅ تکمیل: ${Number(post.matchesCompleted || 0)} | ❌ ناموفق: ${Number(post.matchesFailed || 0)}`,
+    ])),
+    '',
+    '🧾 جزئیات Matchها:',
+    ...((runLog.posts || []).flatMap((post) => (post.matchItems || []).map((item) =>
+      `• @${item.username || '-'} | keyword: ${item.keyword || '-'} | DM: ${item.dm || '-'} | Reply: ${item.reply || '-'} | status: ${item.status || '-'}${item.error ? ` | error: ${item.error}` : ''}`
+    ))),
+    '',
+    `📦 Artifact: ${path.resolve(ARTIFACTS, 'run-summary.json')}`
+  ];
+
+  return lines.join('\n');
+}
+
+async function sendRunSummaryEmail(runLog) {
+  const subject = `🤖 Instagram Automation | ${runLog.matchesCompleted || 0} completed | ${runLog.matchesFailed || 0} failed`;
+  const message = buildRunSummaryEmail(runLog);
+
+  const payload = {
+    name: 'Instagram Automation',
+    _subject: subject,
+    _cc: RUN_EMAIL_CC,
+    _template: 'box',
+    message,
+    run_started_at: runLog.startedAt || '',
+    run_finished_at: runLog.finishedAt || '',
+    keywords: Array.isArray(runLog.keywords) ? runLog.keywords.join(' | ') : '',
+    post_urls: Array.isArray(runLog.postUrls) ? runLog.postUrls.join('\n') : '',
+    comments_scanned: String(runLog.commentsScanned || 0),
+    matches_found: String(runLog.matchesFound || 0),
+    successful_direct_messages: String(runLog.successfulDirectMessages || 0),
+    successful_replies: String(runLog.successfulReplies || 0),
+    matches_completed: String(runLog.matchesCompleted || 0),
+    matches_failed: String(runLog.matchesFailed || 0)
+  };
+
+  appendLog('RUN_EMAIL_ATTEMPT', {
+    recipients: [RUN_EMAIL_TO, RUN_EMAIL_CC],
+    transport: 'FormSubmit',
+    secretRequired: false
+  });
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const response = await fetch(RUN_EMAIL_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+
+      const raw = await response.text();
+      let result = null;
+      try {
+        result = JSON.parse(raw);
+      } catch {
+        result = { raw };
+      }
+
+      if (!response.ok) {
+        throw new Error(`FORM_SUBMIT_HTTP_${response.status}: ${raw.slice(0, 300)}`);
+      }
+
+      if (result && result.success === false) {
+        throw new Error(`FORM_SUBMIT_REJECTED: ${result.message || 'unknown error'}`);
+      }
+
+      appendLog('RUN_EMAIL_SENT', {
+        recipients: [RUN_EMAIL_TO, RUN_EMAIL_CC],
+        transport: 'FormSubmit',
+        attempt,
+        response: result?.message || result?.success || 'accepted'
+      });
+      return true;
+    } catch (error) {
+      lastError = error;
+      appendLog('RUN_EMAIL_ATTEMPT_FAILED', {
+        attempt,
+        error: String(error?.message || error)
+      });
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  appendLog('RUN_EMAIL_FAILED', {
+    recipients: [RUN_EMAIL_TO, RUN_EMAIL_CC],
+    transport: 'FormSubmit',
+    error: String(lastError?.message || lastError || 'unknown error')
+  });
+  return false;
+}
+
 async function loadSession() {
   if (!env.INSTAGRAM_SESSION_B64?.trim()) return null;
   const raw = Buffer.from(env.INSTAGRAM_SESSION_B64.trim(), 'base64').toString('utf8');
@@ -1991,11 +2116,13 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   await sendButton.scrollIntoViewIfNeeded().catch(() => {});
 
-  // Submit exactly once through the normal human action: one Enter.
-  // If Instagram does not clear the composer, use the already located
-  // Send/Post control as the fallback.
-  await input.press('Enter').catch(() => {});
-  await page.waitForTimeout(500);
+  // IMPORTANT: Instagram Desktop exposes the public comment submit control
+  // as the "Post" action on the right side of the main composer. Do NOT use
+  // Enter here: Enter is not the deterministic publish action for this UI
+  // and can create a wrong/unconfirmed submission. We click the exact control
+  // that was located relative to the active composer.
+  await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+  await page.waitForTimeout(650);
 
   let composerCleared = await page.waitForFunction(
     composerToken => {
@@ -2013,8 +2140,10 @@ async function sendMainCommentReply(page, root, username, replyText) {
   ).then(() => true).catch(() => false);
 
   if (!composerCleared) {
+    // Instagram can re-render the composer immediately after the first click.
+    // Re-use the exact same Post control once, but never fall back to Enter.
     await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(650);
     composerCleared = await page.waitForFunction(
       composerToken => {
         const el = document.querySelector(
@@ -2033,7 +2162,7 @@ async function sendMainCommentReply(page, root, username, replyText) {
 
   appendLog('MAIN_COMMENT_SEND_TRIGGERED', {
     username: user,
-    method: composerCleared ? 'enter' : 'main-composer-send-button',
+    method: 'main-composer-send-button',
     payload
   });
 
@@ -3012,6 +3141,18 @@ async function main() {
   } finally {
     runLog.finishedAt = now();
     writeJson('run-summary.json', runLog);
+
+    // Email is sent after the complete run-summary has been assembled.
+    // This transport requires NO SMTP password, NO API key and NO GitHub
+    // secret. The only one-time setup is confirming the FormSubmit recipient
+    // activation email sent to RUN_EMAIL_TO.
+    await sendRunSummaryEmail(runLog).catch(error => {
+      appendLog('RUN_EMAIL_UNHANDLED_FAILURE', {
+        error: String(error?.message || error)
+      });
+    });
+
+    // Persist the final session only after the run + email attempt are done.
     await context.storageState({ path: path.join(ARTIFACTS, 'session-after-run.json') }).catch(() => {});
     await browser.close().catch(() => {});
   }

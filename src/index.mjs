@@ -12,6 +12,8 @@ const SCROLL_WAIT = Math.max(100, Number(env.INSTAGRAM_COMMENT_SCROLL_WAIT_MS ||
 const END_STABLE_ROUNDS = Math.max(1, Number(env.INSTAGRAM_COMMENT_END_STABLE_ROUNDS || 4));
 const ROOT_TIMEOUT_MS = Math.max(3000, Number(env.INSTAGRAM_COMMENT_ROOT_TIMEOUT_MS || 12000));
 const CLICK_TIMEOUT_MS = Math.max(1000, Number(env.INSTAGRAM_COMMENT_CLICK_TIMEOUT_MS || 8000));
+const INTERRUPT_RECOVERY_ATTEMPTS = Math.max(1, Math.min(4, Number(env.INSTAGRAM_INTERRUPT_RECOVERY_ATTEMPTS || 2)));
+const INTERRUPT_RECOVERY_WAIT_MS = Math.max(150, Number(env.INSTAGRAM_INTERRUPT_RECOVERY_WAIT_MS || 500));
 
 function now() {
   return new Date().toISOString();
@@ -300,13 +302,168 @@ async function loadSession() {
   return JSON.parse(raw);
 }
 
-async function safeClick(locator, timeout = 3000) {
+function interruptionRecoveryPattern() {
+  return /^(continue|continue anyway|allow and continue|maybe later|not now|skip|done|got it|باشه|ادامه|ادامه دهید|ادامه دادن|ادامه بده|فعلاً نه|بعداً|بعدا|اکنون نه|نه الان|رد کردن|بی‌خیال|متوجه شدم)$/i;
+}
+
+async function recoverBlockedTarget(page, reason = 'target-not-found') {
+  if (!page || page.isClosed()) return false;
+
+  const token = `ig-recovery-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const pattern = interruptionRecoveryPattern();
+
+  const descriptor = await page.evaluate(({ token }) => {
+    const normalize = value => String(value || '')
+      .normalize('NFKC')
+      .toLocaleLowerCase('fa')
+      .replace(/[\\u200b\\u200c\\u200d\\ufeff]/g, '')
+      .replace(/\\s+/g, ' ')
+      .trim();
+
+    const visible = el => {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      return (
+        s.display !== 'none' &&
+        s.visibility !== 'hidden' &&
+        s.opacity !== '0' &&
+        r.width > 0 &&
+        r.height > 0 &&
+        r.bottom > 0 &&
+        r.right > 0 &&
+        r.top < innerHeight &&
+        r.left < innerWidth
+      );
+    };
+
+    const isControl = el => {
+      if (!el) return false;
+      const tag = el.tagName;
+      return tag === 'BUTTON' || tag === 'A' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'menuitem';
+    };
+
+    const controls = Array.from(document.querySelectorAll('button,a,[role="button"],[role="menuitem"]'))
+      .filter(visible)
+      .map(el => ({
+        el,
+        text: normalize(el.innerText || el.textContent || ''),
+        aria: normalize(el.getAttribute('aria-label') || ''),
+        title: normalize(el.getAttribute('title') || '')
+      }))
+      .filter(x => isControl(x.el));
+
+    const exact = [];
+    const strong = new Set([
+      'continue',
+      'continue anyway',
+      'allow and continue',
+      'maybe later',
+      'not now',
+      'skip',
+      'done',
+      'got it',
+      'ادامه',
+      'ادامه دهید',
+      'ادامه دادن',
+      'ادامه بده',
+      'فعلاً نه',
+      'بعداً',
+      'بعدا',
+      'اکنون نه',
+      'نه الان',
+      'رد کردن',
+      'بی‌خیال',
+      'متوجه شدم'
+    ]);
+
+    for (const item of controls) {
+      const label = [item.text, item.aria, item.title].find(Boolean) || '';
+      if (!label || !strong.has(label)) continue;
+      const r = item.el.getBoundingClientRect();
+      exact.push({
+        el: item.el,
+        label,
+        area: r.width * r.height,
+        top: r.top,
+        left: r.left
+      });
+    }
+
+    exact.sort((a, b) => {
+      const priority = value => {
+        if (value === 'continue' || value === 'ادامه' || value === 'ادامه دهید' || value === 'ادامه بده') return 0;
+        if (value === 'continue anyway' || value === 'allow and continue') return 1;
+        if (value === 'not now' || value === 'اکنون نه' || value === 'نه الان') return 2;
+        if (value === 'maybe later' || value === 'بعداً' || value === 'بعدا') return 3;
+        if (value === 'skip' || value === 'رد کردن') return 4;
+        return 5;
+      };
+      return priority(a.label) - priority(b.label) || a.area - b.area || a.top - b.top;
+    });
+
+    if (!exact.length) return null;
+
+    const best = exact[0];
+    best.el.setAttribute('data-ig-interrupt-recovery', token);
+    return { token, label: best.label };
+  }, { token }).catch(() => null);
+
+  if (!descriptor?.token) return false;
+
+  const safeToken = String(descriptor.token).replace(/"/g, '\\\"');
+  const recovery = page.locator(`[data-ig-interrupt-recovery="${safeToken}"]`).first();
+  if (!(await recovery.isVisible().catch(() => false))) return false;
+
+  appendLog('INTERRUPTION_RECOVERY_FOUND', {
+    reason,
+    action: descriptor.label
+  });
+
+  let clicked = false;
   try {
-    await locator.first().click({ timeout });
-    return true;
+    await recovery.click({ timeout: 1800 });
+    clicked = true;
   } catch {
-    return false;
+    clicked = await recovery.evaluate(el => {
+      if (el instanceof HTMLElement) {
+        el.click();
+        return true;
+      }
+      return false;
+    }).catch(() => false);
   }
+
+  await recovery.evaluate(el => el.removeAttribute('data-ig-interrupt-recovery')).catch(() => {});
+
+  if (clicked) {
+    appendLog('INTERRUPTION_RECOVERY_CLICKED', {
+      reason,
+      action: descriptor.label
+    });
+    await page.waitForTimeout(INTERRUPT_RECOVERY_WAIT_MS).catch(() => {});
+  }
+
+  return clicked;
+}
+
+async function safeClick(locator, timeout = 3000, options = {}) {
+  const page = options?.page || locator?.page?.() || null;
+  const recoveryAttempts = Math.max(0, Math.min(INTERRUPT_RECOVERY_ATTEMPTS, Number(options?.recoveryAttempts ?? INTERRUPT_RECOVERY_ATTEMPTS)));
+  const reason = options?.reason || 'target-click-failed';
+
+  for (let attempt = 0; attempt <= recoveryAttempts; attempt += 1) {
+    try {
+      await locator.first().click({ timeout });
+      return true;
+    } catch {
+      if (!page || attempt >= recoveryAttempts) return false;
+      const recovered = await recoverBlockedTarget(page, reason);
+      if (!recovered) return false;
+    }
+  }
+
+  return false;
 }
 
 async function dismissCommonPopups(page) {
@@ -502,7 +659,11 @@ async function findCommentButton(page) {
 
 async function clickRealCommentButton(page) {
   const ranked = await rankCommentButtonCandidates(page);
-  if (!ranked.length) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  if (!ranked.length) {
+    const recovered = await recoverBlockedTarget(page, 'comment-button-not-found');
+    if (recovered) return findCommentButton(page);
+    throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  }
 
   let sawAnyCandidate = false;
 
@@ -549,7 +710,11 @@ async function clickRealCommentButton(page) {
     await page.waitForTimeout(300);
   }
 
-  if (!sawAnyCandidate) throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  if (!sawAnyCandidate) {
+    const recovered = await recoverBlockedTarget(page, 'comment-button-not-found');
+    if (recovered) return findCommentButton(page);
+    throw new Error('REAL_COMMENT_ICON_NOT_FOUND');
+  }
   throw new Error('COMMENT_UI_DID_NOT_OPEN');
 }
 
@@ -1347,6 +1512,7 @@ async function locateReplyControl(page, row, username) {
 
 
 async function findReplyComposer(page, root, username) {
+  await recoverBlockedTarget(page, 'reply-composer-preflight');
   const usernameNorm = normalizeText(username).replace(/^@/, '');
   const candidates = [
     root.locator('textarea').last(),
@@ -1612,6 +1778,7 @@ async function verifyReplyIsNested(root, username, commentText, replyText, befor
 
 
 async function sendMainCommentReply(page, root, username, replyText) {
+  await recoverBlockedTarget(page, 'main-comment-preflight');
   const textToSend = String(replyText || '').trim();
   const user = String(username || '').trim().replace(/^@+/, '');
 
@@ -1948,7 +2115,7 @@ async function sendMainCommentReply(page, root, username, replyText) {
    * - vertically aligned
    * - small icon/button
    */
-  const sendInfo = await page.evaluate(composerToken => {
+  const locateMainCommentSendInfo = async () => page.evaluate(composerToken => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
       .toLocaleLowerCase('fa')
@@ -2096,6 +2263,16 @@ async function sendMainCommentReply(page, root, username, replyText) {
     };
   }, composerDescriptor.token);
 
+  let sendInfo = await locateMainCommentSendInfo();
+
+  if (!sendInfo?.token) {
+    const recovered = await recoverBlockedTarget(page, 'main-comment-post-button');
+    if (recovered) {
+      await page.waitForTimeout(INTERRUPT_RECOVERY_WAIT_MS);
+      sendInfo = await locateMainCommentSendInfo();
+    }
+  }
+
   if (!sendInfo?.token) {
     throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
   }
@@ -2110,18 +2287,31 @@ async function sendMainCommentReply(page, root, username, replyText) {
   const sendSelector = `[data-ig-main-comment-send="${String(sendInfo.token).replace(/"/g, '\\"')}"]`;
   const sendButton = page.locator(sendSelector).first();
 
-  if (!(await sendButton.isVisible().catch(() => false))) {
+  let activeSendButton = page.locator(sendSelector).first();
+
+  if (!(await activeSendButton.isVisible().catch(() => false))) {
+    const recovered = await recoverBlockedTarget(page, 'main-comment-post-button-hidden');
+    if (recovered) {
+      sendInfo = await locateMainCommentSendInfo();
+      if (sendInfo?.token) {
+        const reboundSelector = `[data-ig-main-comment-send="${String(sendInfo.token).replace(/"/g, '\\"')}"]`;
+        activeSendButton = page.locator(reboundSelector).first();
+      }
+    }
+  }
+
+  if (!(await activeSendButton.isVisible().catch(() => false))) {
     throw new Error('MAIN_COMMENT_SEND_BUTTON_NOT_FOUND');
   }
 
-  await sendButton.scrollIntoViewIfNeeded().catch(() => {});
+  await activeSendButton.scrollIntoViewIfNeeded().catch(() => {});
 
   // IMPORTANT: Instagram Desktop exposes the public comment submit control
   // as the "Post" action on the right side of the main composer. Do NOT use
   // Enter here: Enter is not the deterministic publish action for this UI
   // and can create a wrong/unconfirmed submission. We click the exact control
   // that was located relative to the active composer.
-  await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+  await activeSendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
   await page.waitForTimeout(650);
 
   let composerCleared = await page.waitForFunction(
@@ -2142,7 +2332,7 @@ async function sendMainCommentReply(page, root, username, replyText) {
   if (!composerCleared) {
     // Instagram can re-render the composer immediately after the first click.
     // Re-use the exact same Post control once, but never fall back to Enter.
-    await sendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
+    await activeSendButton.click({ timeout: CLICK_TIMEOUT_MS, force: true });
     await page.waitForTimeout(650);
     composerCleared = await page.waitForFunction(
       composerToken => {
@@ -2383,6 +2573,7 @@ async function getProfilePrivacyState(page) {
 
 
 async function clickProfileMessageAction(dmPage, isPrivate) {
+  await recoverBlockedTarget(dmPage, 'profile-message-preflight');
   const messageRegex = /^(Message|Send message|پیام|ارسال پیام|ارسال پیام مستقیم)$/i;
   const moreRegex = /^(More options|Options|More|گزینه‌های بیشتر|گزینه ها|بیشتر)$/i;
 
@@ -2392,9 +2583,7 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
       dmPage.getByRole('link', { name: messageRegex }).first()
     ];
     for (const direct of directCandidates) {
-      if (await direct.isVisible().catch(() => false)) {
-        if (await safeClick(direct, 3500)) return 'message-button';
-      }
+      if (await safeClick(direct, 3500, { page: dmPage, reason: 'profile-message-button' })) return 'message-button';
     }
   }
 
@@ -2408,11 +2597,9 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
 
   let menuOpened = false;
   for (const more of moreCandidates) {
-    if (await more.isVisible().catch(() => false)) {
-      if (await safeClick(more, 2500)) {
-        menuOpened = true;
-        break;
-      }
+    if (await safeClick(more, 2500, { page: dmPage, reason: 'profile-more-menu' })) {
+      menuOpened = true;
+      break;
     }
   }
 
@@ -2426,9 +2613,7 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
     ];
 
     for (const item of menuItems) {
-      if (await item.isVisible().catch(() => false)) {
-        if (await safeClick(item, 3000)) return isPrivate ? 'private-menu-message' : 'more-menu-message';
-      }
+      if (await safeClick(item, 3000, { page: dmPage, reason: 'private-profile-message-menu' })) return isPrivate ? 'private-menu-message' : 'more-menu-message';
     }
   }
 
@@ -2439,9 +2624,7 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
     dmPage.getByRole('link', { name: messageRegex }).first()
   ];
   for (const delayed of delayedCandidates) {
-    if (await delayed.isVisible().catch(() => false)) {
-      if (await safeClick(delayed, 2500)) return 'message-button-delayed';
-    }
+    if (await safeClick(delayed, 2500, { page: dmPage, reason: 'profile-message-button-delayed' })) return 'message-button-delayed';
   }
 
   throw new Error('DM_MESSAGE_ACTION_NOT_FOUND');
@@ -2449,6 +2632,7 @@ async function clickProfileMessageAction(dmPage, isPrivate) {
 
 
 async function findDmComposer(dmPage, username) {
+  await recoverBlockedTarget(dmPage, 'dm-composer-preflight');
   const candidates = await dmPage.evaluate(() => {
     const normalize = value => String(value || '')
       .normalize('NFKC')
@@ -2749,6 +2933,17 @@ async function sendDM(dmPage, profilePath, username, message) {
       lastComposerError = error;
     }
     await dmPage.waitForTimeout(500 + attempt * 250);
+  }
+
+  if (!composerResult?.input) {
+    const recovered = await recoverBlockedTarget(dmPage, 'dm-composer-not-found');
+    if (recovered) {
+      await dmPage.waitForTimeout(INTERRUPT_RECOVERY_WAIT_MS);
+      composerResult = await findDmComposer(dmPage, username).catch(error => {
+        lastComposerError = error;
+        return null;
+      });
+    }
   }
 
   if (!composerResult?.input) {
